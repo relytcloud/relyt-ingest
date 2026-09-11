@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{
-    cluster_id_is_unset, dsn_with_application_name, validate_staging, ClientConfig, StagingConfig,
+    cluster_id_is_unset, connect_control, validate_staging, ClientConfig, StagingConfig,
     StagingService, StreamMode,
 };
 use crate::error::{Error, Result};
@@ -43,11 +43,7 @@ impl Client {
     /// order, where both are known from the config.
     pub async fn connect(cfg: ClientConfig) -> Result<Client> {
         cfg.validate()?;
-        let (control, connection) = tokio_postgres::connect(
-            &dsn_with_application_name(&cfg.control_dsn),
-            tokio_postgres::NoTls,
-        )
-        .await?;
+        let (control, connection) = connect_control(&cfg.control_dsn).await?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::warn!(error = %e, "client control connection closed");
@@ -78,7 +74,7 @@ impl Client {
         })
     }
 
-    /// Recovery handshake (design doc §6) + writer construction. Returns the
+    /// Recovery handshake + writer construction. Returns the
     /// writer and the recovery plan (the caller seeks Kafka to
     /// `plan.kafka_resume_offset` before producing new appends).
     pub async fn open_table(

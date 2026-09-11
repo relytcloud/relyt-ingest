@@ -124,13 +124,39 @@ impl StagingConfig {
 /// which `add_by` cannot reach because loads execute in a background worker.
 pub(crate) const APPLICATION_NAME: &str = concat!("relyt-ingest/", env!("CARGO_PKG_VERSION"));
 
-/// Append `application_name` to a DSN unless the caller already set one --
-/// an explicit value in `control_dsn` is the operator's choice and wins.
-pub(crate) fn dsn_with_application_name(dsn: &str) -> String {
-    if dsn.contains("application_name") {
-        return dsn.to_string();
+/// Parse `control_dsn` into a connection config that announces
+/// [`APPLICATION_NAME`] unless the DSN already sets one -- an explicit value
+/// is the operator's choice and wins.
+///
+/// Parsed, not string-appended. tokio-postgres accepts both the `key=value`
+/// form and `postgresql://` URLs; appending ` application_name=...` to a URL
+/// lands inside its last component (the dbname, or a `?sslmode=` value) and
+/// the server then rejects the connection with an error that names the wrong
+/// thing. Parsing also makes "already set" a real check rather than a
+/// substring match that a password containing the word would trip.
+pub(crate) fn control_config(dsn: &str) -> Result<tokio_postgres::Config> {
+    let mut cfg: tokio_postgres::Config = dsn.parse().map_err(|e| {
+        Error::Config(format!(
+            "control_dsn is not a valid tokio-postgres connection string: {}",
+            crate::error::describe_db_error(&e)
+        ))
+    })?;
+    if cfg.get_application_name().is_none() {
+        cfg.application_name(APPLICATION_NAME);
     }
-    format!("{dsn} application_name={APPLICATION_NAME}")
+    Ok(cfg)
+}
+
+/// Open a control connection from `control_dsn` (see [`control_config`]).
+/// The caller spawns the returned connection future, exactly as with
+/// `tokio_postgres::connect`.
+pub(crate) async fn connect_control(
+    dsn: &str,
+) -> Result<(
+    tokio_postgres::Client,
+    tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+)> {
+    Ok(control_config(dsn)?.connect(tokio_postgres::NoTls).await?)
 }
 
 /// Structural checks on one staging location, wherever it came from.
@@ -307,8 +333,8 @@ pub struct ClientConfig {
     /// audited, manually retried/skipped per SOP). `None` maps to -1 =
     /// infinite retries — poison files then never reach FAIL; only use this
     /// when an external watcher handles head-stuck alarms.
-    /// Default 15 ≈ ~5h to converge with the server's backoff (待办 #15:
-    /// 10≈3.5h / 20≈8.5h).
+    /// Default 15 ≈ ~5h to converge with the server's backoff (10 ≈ 3.5h,
+    /// 20 ≈ 8.5h).
     pub retry_max: Option<i32>,
 
     pub csv: CsvConfig,
@@ -547,6 +573,32 @@ mod tests {
     fn expect_range_err(cfg: &ClientConfig, param: &str) {
         let msg = cfg.validate().expect_err("must be rejected").to_string();
         assert!(msg.contains(param), "error must name `{param}`, got: {msg}");
+    }
+
+    #[test]
+    fn control_config_sets_application_name_on_both_dsn_forms() {
+        let kv = control_config("host=h port=5432 user=u dbname=d").unwrap();
+        assert_eq!(kv.get_application_name(), Some(APPLICATION_NAME));
+        assert_eq!(kv.get_dbname(), Some("d"));
+
+        // The URL form is where string-appending used to break: the suffix
+        // landed inside dbname (or the sslmode value).
+        let url = control_config("postgresql://u:pw@h:5432/prod?sslmode=disable").unwrap();
+        assert_eq!(url.get_application_name(), Some(APPLICATION_NAME));
+        assert_eq!(url.get_dbname(), Some("prod"));
+        assert_eq!(url.get_ssl_mode(), tokio_postgres::config::SslMode::Disable);
+    }
+
+    #[test]
+    fn control_config_keeps_an_explicit_application_name() {
+        let cfg = control_config("host=h user=u application_name=mine").unwrap();
+        assert_eq!(cfg.get_application_name(), Some("mine"));
+    }
+
+    #[test]
+    fn control_config_rejects_garbage() {
+        let err = control_config("this is not a dsn").unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
     }
 
     #[test]

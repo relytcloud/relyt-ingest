@@ -62,8 +62,8 @@ pub fn encode_serial_seq(epoch_ms: u64, seq: u32) -> Result<i64> {
         return Err(Error::Naming(format!("epoch {epoch_ms} exceeds 43 bits")));
     }
     if seq > MAX_SEQ {
-        // Callers must switch to a fresh epoch before this fires (design doc:
-        // "触顶主动换 epoch").
+        // Callers roll to a fresh epoch before this can fire: the seq space
+        // never wraps within one epoch.
         return Err(Error::Naming(format!("seq {seq} exceeds 20 bits")));
     }
     Ok(((epoch_ms << SEQ_BITS) | seq as u64) as i64)
@@ -81,25 +81,40 @@ pub fn decode_serial_seq(serial_seq: i64) -> (u64, u32) {
 /// `writer_id` rules, enforced once at `open_table`: 1..=64 chars from
 /// `[A-Za-z0-9._-]`, not starting with `_` (the `_meta/` convention reserves
 /// the underscore prefix for bookkeeping), no path or identifier separators.
-pub fn validate_writer_id(writer_id: &str) -> Result<()> {
-    if writer_id.is_empty() || writer_id.len() > WRITER_ID_MAX_LEN {
+/// The rules every staging path segment obeys: non-empty, at most
+/// `WRITER_ID_MAX_LEN` bytes, `[A-Za-z0-9._-]` only, and not a bare run of
+/// dots -- `.` and `..` resolve to the enclosing directory once the key is
+/// read as a path, which would move `_meta/` bookkeeping up a level. `kind`
+/// names the segment in the error text.
+fn validate_path_segment(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > WRITER_ID_MAX_LEN {
         return Err(Error::Config(format!(
-            "writer_id must be 1..={WRITER_ID_MAX_LEN} chars, got {}",
-            writer_id.len()
+            "{kind} must be 1..={WRITER_ID_MAX_LEN} chars, got {}",
+            value.len()
         )));
     }
-    if writer_id.starts_with('_') {
-        return Err(Error::Config(
-            "writer_id must not start with '_' (reserved for bookkeeping)".into(),
-        ));
+    if value.chars().all(|c| c == '.') {
+        return Err(Error::Config(format!(
+            "{kind} `{value}` is not a valid path segment"
+        )));
     }
-    if let Some(bad) = writer_id
+    if let Some(bad) = value
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
     {
         return Err(Error::Config(format!(
-            "writer_id contains `{bad}`; allowed characters are [A-Za-z0-9._-]"
+            "{kind} contains `{bad}`; allowed characters are [A-Za-z0-9._-]"
         )));
+    }
+    Ok(())
+}
+
+pub fn validate_writer_id(writer_id: &str) -> Result<()> {
+    validate_path_segment("writer_id", writer_id)?;
+    if writer_id.starts_with('_') {
+        return Err(Error::Config(
+            "writer_id must not start with '_' (reserved for bookkeeping)".into(),
+        ));
     }
     Ok(())
 }
@@ -110,26 +125,7 @@ pub fn validate_writer_id(writer_id: &str) -> Result<()> {
 /// `state.json`/`lock` somewhere a lifecycle rule can delete them). Applied
 /// to the configured value and to what the server returns alike.
 pub fn validate_cluster_id(cluster_id: &str) -> Result<()> {
-    if cluster_id.is_empty() || cluster_id.len() > WRITER_ID_MAX_LEN {
-        return Err(Error::Config(format!(
-            "cluster_id must be 1..={WRITER_ID_MAX_LEN} chars, got {}",
-            cluster_id.len()
-        )));
-    }
-    if cluster_id.chars().all(|c| c == '.') {
-        return Err(Error::Config(format!(
-            "cluster_id `{cluster_id}` is not a valid path segment"
-        )));
-    }
-    if let Some(bad) = cluster_id
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-    {
-        return Err(Error::Config(format!(
-            "cluster_id contains `{bad}`; allowed characters are [A-Za-z0-9._-]"
-        )));
-    }
-    Ok(())
+    validate_path_segment("cluster_id", cluster_id)
 }
 
 /// The OID-based identity every path and server-side name derives from.
@@ -403,6 +399,8 @@ mod tests {
         assert!(validate_writer_id("_meta").is_err()); // reserved prefix
         assert!(validate_writer_id("a/b").is_err()); // path separator
         assert!(validate_writer_id("a:b").is_err()); // identifier separator
+        assert!(validate_writer_id("..").is_err()); // traversal, same rule as cluster_id
+        assert!(validate_writer_id(".").is_err());
         assert!(validate_writer_id(&"x".repeat(65)).is_err());
     }
 

@@ -60,8 +60,8 @@ impl TableSchema {
 
 /// Fetch schema + PK from the control connection.
 ///
-/// TODO(#1): local schema cache fallback (design doc: cache兜底 so open_table
-/// survives a master outage when the schema is already known).
+/// TODO: local schema cache fallback, so open_table survives a master outage
+/// when the schema is already known.
 pub async fn fetch_table_schema(
     client: &tokio_postgres::Client,
     table: &str,

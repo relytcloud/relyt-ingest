@@ -20,7 +20,7 @@
 //!   file as an already-consumed replay -- a silently skipped load.
 //!
 //! The cost is that an `append` which trips the size threshold pays the OSS
-//! latency, and concurrent appends queue behind it. TODO(#1): move rotation
+//! latency, and concurrent appends queue behind it. TODO: move rotation
 //! onto a dedicated writer task fed by a channel, which keeps the ordering
 //! guarantee without blocking producers.
 
@@ -349,7 +349,7 @@ impl WriterInner {
 
     /// Rotate the current buffer into exactly one staged CSV object + one
     /// notify request. One append burst = at most one object per rotation
-    /// (design: 一次 append=一个对象 under the double threshold).
+    /// under the double threshold.
     ///
     /// Runs entirely under the state lock — see the module docs for why the
     /// drain/put/enqueue triple must not be split.
@@ -380,7 +380,7 @@ impl WriterInner {
         let end = batches.iter().map(|(_, _, e)| *e).max().unwrap();
 
         if st.next_seq > crate::naming::MAX_SEQ {
-            // Seq exhausted: roll to a fresh epoch (design: 触顶主动换 epoch).
+            // Seq exhausted: roll to a fresh epoch.
             st.epoch_ms += 1;
             st.next_seq = 0;
         }
@@ -478,7 +478,7 @@ impl WriterInner {
         object_key: &str,
         avg_row_bytes: Option<f64>,
     ) -> Result<StageStats> {
-        // 1. Intra-file PK dedup, last write wins (hard requirement, §4).
+        // 1. Intra-file PK dedup, last write wins (hard requirement).
         let only_batches: Vec<RecordBatch> = batches.iter().map(|(b, _, _)| b.clone()).collect();
         let keep = if self.cfg.stream_mode == StreamMode::Upsert {
             dedup_last_wins(&only_batches, &self.schema.pk_indices()?)?
@@ -652,12 +652,7 @@ impl WriterInner {
     async fn gc_pass(&self) {
         // Fresh short-lived connection: the pass is hourly and must not
         // share retry fate with the notify loops.
-        let (client, conn) = match tokio_postgres::connect(
-            &crate::config::dsn_with_application_name(&self.cfg.control_dsn),
-            tokio_postgres::NoTls,
-        )
-        .await
-        {
+        let (client, conn) = match crate::config::connect_control(&self.cfg.control_dsn).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "gc: connect failed, skipping this pass");
@@ -817,6 +812,16 @@ fn spawn_ticker(inner: &Arc<WriterInner>) {
             if inner.is_fenced() {
                 tracing::info!(group = %inner.serial_group,
                     "ticker stopped: writer is fenced");
+                break;
+            }
+            // Fatal serial-contract violation: the notifier has stopped
+            // submitting for this group and check_health refuses every
+            // rotation, so ticking on would log the same failure every period
+            // until the process exits. Stop, as for fenced; the buffered rows
+            // stay unstaged until the writer is reopened.
+            if let Some(reason) = inner.notifier.fatal(&inner.serial_group) {
+                tracing::warn!(group = %inner.serial_group, %reason,
+                    "ticker stopped: serial-contract violation; buffered rows are not staged");
                 break;
             }
             if let Err(e) = inner.rotate_if_aged().await {
@@ -1092,35 +1097,31 @@ fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
 
             // Fresh short-lived connection per sample: 2 queries / 30s is
             // negligible, and there is no connection state to babysit.
-            let watermark: Option<i64> = match tokio_postgres::connect(
-                &crate::config::dsn_with_application_name(&inner.cfg.control_dsn),
-                tokio_postgres::NoTls,
-            )
-            .await
-            {
-                Ok((c, conn)) => {
-                    tokio::spawn(conn);
-                    match c
-                        .query_one(
-                            "SELECT pg_catalog.relyt_get_serial_group_watermark($1)",
-                            &[&inner.serial_group],
-                        )
-                        .await
-                    {
-                        Ok(row) => row.get(0),
-                        Err(e) => {
-                            tracing::warn!(error = %e, group = %inner.serial_group,
+            let watermark: Option<i64> =
+                match crate::config::connect_control(&inner.cfg.control_dsn).await {
+                    Ok((c, conn)) => {
+                        tokio::spawn(conn);
+                        match c
+                            .query_one(
+                                "SELECT pg_catalog.relyt_get_serial_group_watermark($1)",
+                                &[&inner.serial_group],
+                            )
+                            .await
+                        {
+                            Ok(row) => row.get(0),
+                            Err(e) => {
+                                tracing::warn!(error = %e, group = %inner.serial_group,
                                 "lag sample: watermark query failed, skipping round");
-                            continue;
+                                continue;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, group = %inner.serial_group,
+                    Err(e) => {
+                        tracing::warn!(error = %e, group = %inner.serial_group,
                         "lag sample: control connection failed, skipping round");
-                    continue;
-                }
-            };
+                        continue;
+                    }
+                };
 
             // Re-LIST only when the previous listing has aged past
             // lag_list_interval (30s full listings of a

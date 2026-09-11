@@ -1,5 +1,5 @@
-//! Notify thread: decoupled from the write path by an in-process FIFO
-//! (design doc §6). A master outage means latency, never data loss and never
+//! Notify thread: decoupled from the write path by an in-process FIFO. A
+//! master outage means latency, never data loss and never
 //! backpressure on `append` — the queue is tiny (one small struct per staged
 //! file; a day of backlog ≈ ~1MB).
 //!
@@ -423,12 +423,8 @@ async fn submit(
     }
 }
 
-async fn connect(dsn: &str) -> std::result::Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(
-        &crate::config::dsn_with_application_name(dsn),
-        tokio_postgres::NoTls,
-    )
-    .await?;
+async fn connect(dsn: &str) -> Result<tokio_postgres::Client> {
+    let (client, connection) = crate::config::connect_control(dsn).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::warn!(error = %e, "notify: control connection closed");

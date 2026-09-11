@@ -1,4 +1,4 @@
-//! `open_table` recovery protocol (design doc §6, one round trip):
+//! `open_table` recovery protocol, one round trip:
 //!
 //! 1. fetch schema + PK check (local cache as fallback — not implemented in
 //!    the skeleton);
