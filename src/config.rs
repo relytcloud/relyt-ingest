@@ -216,7 +216,7 @@ pub enum StagingService {
 }
 
 /// CSV serialization knobs. The on-the-wire format itself (quoting, NULL,
-/// header) is fixed by [`crate::csv`] to what the Relyt master's loader expects;
+/// header) is fixed by the crate's CSV serializer to what the Relyt master's loader expects;
 /// only the delimiter is configurable because it must round-trip into the
 /// job's load options.
 /// How staged CSV objects are stored. The Relyt master sniffs gzip magic bytes
@@ -279,7 +279,7 @@ pub struct ClientConfig {
     pub staging_compression: StagingCompression,
 
     /// Explicit cluster identity for staging paths; overrides the server's
-    /// `relyt_get_instance_id()`. See [`cluster_id_is_unset`] for semantics.
+    /// `relyt_get_instance_id()`; "-1", an empty string and NULL there count as unset.
     pub cluster_id: Option<String>,
 
     /// How often each writer's staging GC pass runs. The pass deletes only
@@ -313,7 +313,7 @@ pub struct ClientConfig {
 
     pub csv: CsvConfig,
 
-    /// Consumption-lag sampling period for [`TableWriter::lag`]
+    /// Consumption-lag sampling period for [`crate::TableWriter::lag`]
     /// (crate::table::TableWriter::lag); internal default 30s. Hidden: not a
     /// customer knob, only the e2e suite shrinks it.
     #[doc(hidden)]

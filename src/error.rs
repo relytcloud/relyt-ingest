@@ -76,7 +76,7 @@ pub enum Error {
     /// path such as `Client::connect` / `open_table`. The notify thread never
     /// returns this; it retries internally.
     ///
-    /// Rendered through [`describe_db_error`] rather than the inner error's
+    /// Rendered through `describe_db_error` rather than the inner error's
     /// own `Display`, which is the bare string "db error" -- everything the
     /// operator needs sits in the DbError beside it.
     #[error("relyt control connection error: {}", describe_db_error(.0))]

@@ -1,6 +1,6 @@
 //! Staging object store: put (whole object, deterministic name = idempotent
 //! retry), list (recovery source of truth), and the writer's persistent
-//! state under `_meta/` (see [`crate::state`]).
+//! state under `_meta/` (see the `state` module).
 //!
 //! All keys derive from a [`WriterIdentity`]; the layout contract lives in
 //! [`crate::naming`]'s module docs.

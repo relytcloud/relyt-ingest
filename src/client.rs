@@ -37,7 +37,7 @@ impl Client {
     /// Establish staging access and the Relyt control connection, resolve the
     /// cluster identity, and start the background notify task.
     ///
-    /// Under the default [`StagingOwner::Relyt`] the staging location and its
+    /// Under the default [`crate::StagingOwner::Relyt`] the staging location and its
     /// credentials are fetched here, so the control connection must be up
     /// before staging access exists -- the reverse of the customer-owned
     /// order, where both are known from the config.
