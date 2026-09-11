@@ -1,0 +1,22 @@
+# The toolchain we develop and test with. It is deliberately NOT the same as
+# Cargo.toml's rust-version, and the two answer different questions:
+#
+#   rust-version (1.85)  = the floor we promise consumers. Lower is better:
+#                          cargo hard-errors below it, so it is a hard gate on
+#                          the consumer's build. Proven by the msrv-check CI
+#                          job, which compiles at exactly 1.85.
+#   this file    (1.98.1) = what we build and test with. The customer runs the
+#                          latest stable, so testing here is what surfaces new
+#                          deny-by-default lints and diagnostics before they
+#                          see them. Pinned rather than "stable" so a release
+#                          day cannot turn CI red out of nowhere; bump it every
+#                          few months, keeping it in the customer's era.
+#
+# arrow is a separate axis and stays at 58: Rust types are identified per crate
+# version, so the RecordBatch the customer passes into append() must come from
+# the same arrow-array major we compile against. deltalake-core 0.32.x pins
+# arrow ^58, so that is where the ecosystem sits until deltalake moves.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt"]

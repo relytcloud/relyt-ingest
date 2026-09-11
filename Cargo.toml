@@ -1,0 +1,56 @@
+[package]
+name = "relyt-ingest"
+version = "0.1.0"
+edition = "2021"
+# Lowest rustc this crate actually builds on, not the one we happen to develop
+# with: cargo hard-errors when the active rustc is below any package's
+# rust-version, so every notch we declare here is a notch a consumer is forced
+# to have. 1.85 is arrow 58's own floor (it ships as edition-2024 crates) and
+# nothing in our code needs more. CI proves it on every run -- see the
+# msrv-check CI job, which compiles at exactly this version.
+rust-version = "1.85"
+resolver = "3"
+description = "Rust ingest SDK: Kafka -> OSS/S3 CSV staging -> Relyt tables via server-side upsert loads, delta-rs style API"
+license = "Apache-2.0"
+repository = "https://github.com/relytcloud/relyt-ingest"
+documentation = "https://docs.rs/relyt-ingest"
+readme = "README.md"
+keywords = ["relyt", "ingest", "kafka", "arrow", "upsert"]
+categories = ["database"]
+# What `cargo package` ships. The integration suite, the CI helpers, the cargo
+# source-replacement config and any CI definition at the repository root are
+# bound to Relyt's internal infrastructure and are not part of the library.
+exclude = ["tests/", "ci/", ".cargo/", "/*.yml"]
+
+[dependencies]
+# Locked to the customer's stack (they reported arrow-array 58.4.0 with
+# deltalake 0.32.4): arrow types cross the API boundary in `append`, so a major
+# version mismatch would not even compile against their RecordBatch.
+arrow-array = "58"
+arrow-schema = "58"
+
+# OSS/S3 unified access. Keep default features: TLS lives there
+# (`reqwest/rustls-tls` has no standalone toggle) -- with default-features=false
+# the binary had NO TLS backend, and https requests only "worked" on machines
+# whose HTTP(S)_PROXY let reqwest hand the plaintext request (credentials
+# included) to a proxy for TLS origination. CI without a proxy exposed it as
+# "invalid URL, scheme is not http".
+opendal = { version = "0.50", features = ["services-oss", "services-s3"] }
+
+# Control connection: schema fetch, watermark UDF, zdb_add_async_load_job.
+tokio-postgres = "0.7"
+
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# gzip for staged CSV objects (default on). The Relyt master sniffs the gzip
+# magic bytes, so compressed objects need no extra load option.
+flate2 = "1"
+
+# state.json under _meta/ (writer bookkeeping).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
