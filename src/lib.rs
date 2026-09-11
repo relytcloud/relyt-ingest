@@ -133,8 +133,7 @@ pub mod staging;
 
 pub use client::Client;
 pub use config::{
-    ClientConfig, CsvConfig, StagingCompression, StagingConfig, StagingOwner, StagingService,
-    StreamMode,
+    ClientConfig, CsvConfig, Staging, StagingCompression, StagingConfig, StagingService, StreamMode,
 };
 pub use error::{Error, Result};
 pub use recovery::RecoveryPlan;

@@ -27,26 +27,39 @@ pub enum StreamMode {
     InsertOnly,
 }
 
-/// Who owns the staging bucket, and therefore where its settings come from.
+/// Where the staging bucket comes from, and therefore where its settings live.
 ///
-/// The two modes differ in more than the bucket: under `Relyt` no credential
-/// ever appears in your configuration or your repository, because the client
-/// fetches one at connect time. Under `Customer` your credentials necessarily
-/// reach the Relyt master as well -- its loader has to read the objects you
-/// wrote -- so that mode is a different security posture, not just a
-/// different location. See GUIDE.md.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StagingOwner {
-    /// Relyt-managed bucket (the default): leave [`ClientConfig::staging`]
-    /// unset and the client asks the server for the location and credentials.
+/// The two variants differ in more than the bucket: under `Relyt` no
+/// credential ever appears in your configuration or your repository, because
+/// the client fetches one at connect time. Under `Customer` your credentials
+/// necessarily reach the Relyt master as well -- its loader has to read the
+/// objects you wrote -- so that variant is a different security posture, not
+/// just a different location. See GUIDE.md.
+///
+/// One field, two shapes: the bucket lives inside the `Customer` variant, so
+/// there is no separate owner flag that could disagree with it.
+#[derive(Debug, Clone, Default)]
+pub enum Staging {
+    /// Relyt-managed bucket (the default): the client asks the server for the
+    /// location and credentials at connect time.
     #[default]
     Relyt,
-    /// Your own bucket: [`ClientConfig::staging`] must be filled in, and the
-    /// client never asks the server for staging settings.
-    Customer,
+    /// Your own bucket, fully described; the client never asks the server for
+    /// staging settings.
+    Customer(StagingConfig),
 }
 
-/// OSS/S3 staging bucket access. Only needed with [`StagingOwner::Customer`];
+impl Staging {
+    /// The customer-supplied bucket, if this is the `Customer` variant.
+    pub fn customer(&self) -> Option<&StagingConfig> {
+        match self {
+            Staging::Relyt => None,
+            Staging::Customer(s) => Some(s),
+        }
+    }
+}
+
+/// OSS/S3 staging bucket access. Only needed with [`Staging::Customer`];
 /// under the default the server supplies the equivalent at connect time.
 /// Credentials are fixed AK/SK; rotation is an operational SOP with an
 /// old/new overlap window, so the SDK just takes
@@ -216,6 +229,9 @@ pub(crate) fn derive_aws_region(endpoint: &str) -> Option<String> {
         .strip_prefix("https://")
         .or_else(|| endpoint.strip_prefix("http://"))
         .unwrap_or(endpoint);
+    // A `:port` suffix is not part of the region-bearing name; the OSS
+    // detection in parse_staging_url strips it too, so the two agree.
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
     let rest = host
         .strip_suffix(".amazonaws.com.cn")
         .or_else(|| host.strip_suffix(".amazonaws.com"))?;
@@ -270,18 +286,13 @@ impl Default for CsvConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConfig {
-    /// Who owns the staging bucket. Leave at the default
-    /// ([`StagingOwner::Relyt`]) and the client fetches the location and
+    /// Where the staging bucket comes from. Leave at the default
+    /// ([`Staging::Relyt`]) and the client fetches the location and
     /// credentials from the server at connect time, so nothing secret lives
-    /// in your configuration.
-    pub staging_owner: StagingOwner,
-    /// Your own staging bucket. Required with [`StagingOwner::Customer`] and
-    /// rejected otherwise -- the two are cross-checked at connect, because
-    /// the alternative failure is silent and bad: a bucket filled in while
-    /// the owner says Relyt would send your data to Relyt's bucket instead.
-    pub staging: Option<StagingConfig>,
+    /// in your configuration; [`Staging::Customer`] carries your own bucket.
+    pub staging: Staging,
     /// Control connection DSN (tokio-postgres format). Used for schema fetch,
     /// `relyt_get_serial_group_watermark`, and `zdb_add_async_load_job`.
     /// The account only needs: EXECUTE on the two UDFs + read access to the
@@ -367,6 +378,83 @@ pub struct ClientConfig {
     pub bypass_range_checks: bool,
 }
 
+/// Hand-written for the same reason as [`StagingConfig`]'s: `control_dsn` is
+/// the one secret a Relyt-managed deployment still holds, and a derived Debug
+/// would print its password verbatim through any `?cfg` in a log line.
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("staging", &self.staging)
+            .field("control_dsn", &mask_dsn(&self.control_dsn))
+            .field("rotate_size_bytes", &self.rotate_size_bytes)
+            .field("rotate_interval_max", &self.rotate_interval_max)
+            .field("stream_mode", &self.stream_mode)
+            .field("staging_compression", &self.staging_compression)
+            .field("cluster_id", &self.cluster_id)
+            .field("gc_interval", &self.gc_interval)
+            .field("gc_retain_days", &self.gc_retain_days)
+            .field("gc_retain_min_files", &self.gc_retain_min_files)
+            .field("lock_heartbeat_interval", &self.lock_heartbeat_interval)
+            .field("lock_lease_timeout", &self.lock_lease_timeout)
+            .field("retry_max", &self.retry_max)
+            .field("csv", &self.csv)
+            .field("lag_sample_interval", &self.lag_sample_interval)
+            .field("lag_list_interval", &self.lag_list_interval)
+            .field("state_heartbeat_interval", &self.state_heartbeat_interval)
+            .field("bypass_range_checks", &self.bypass_range_checks)
+            .finish()
+    }
+}
+
+/// Redact the password in a tokio-postgres DSN for display, in both forms it
+/// accepts: `password=...` (bare or single-quoted) in the key=value form, and
+/// `://user:password@` in URLs. Everything else stays visible -- host,
+/// database and user are what a troubleshooter needs to see.
+pub(crate) fn mask_dsn(dsn: &str) -> String {
+    if let Some(scheme_end) = dsn.find("://") {
+        let rest = &dsn[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            if let Some(colon) = rest[..at].find(':') {
+                return format!(
+                    "{}{}:***{}",
+                    &dsn[..scheme_end + 3],
+                    &rest[..colon],
+                    &rest[at..]
+                );
+            }
+        }
+        return dsn.to_string();
+    }
+    let mut out = String::with_capacity(dsn.len());
+    let mut rest = dsn;
+    // ASCII lowercasing keeps byte offsets, so `i` indexes `rest` directly.
+    while let Some(i) = rest.to_ascii_lowercase().find("password=") {
+        let key_end = i + "password=".len();
+        out.push_str(&rest[..key_end]);
+        out.push_str("***");
+        let value = &rest[key_end..];
+        let consumed = match value.strip_prefix('\'') {
+            // Quoted value: through the closing quote, skipping `\'` escapes.
+            Some(quoted) => {
+                let mut escaped = false;
+                let mut end = None;
+                for (j, c) in quoted.char_indices() {
+                    if c == '\'' && !escaped {
+                        end = Some(j);
+                        break;
+                    }
+                    escaped = c == '\\' && !escaped;
+                }
+                end.map_or(value.len(), |j| 1 + j + 1)
+            }
+            None => value.find(char::is_whitespace).unwrap_or(value.len()),
+        };
+        rest = &value[consumed..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl ClientConfig {
     pub const DEFAULT_ROTATE_SIZE: u64 = 64 * 1024 * 1024;
     /// Upper bound for `rotate_size_bytes`. A rotation renders the whole
@@ -390,31 +478,10 @@ impl ClientConfig {
     /// a double quote inside a credential silently breaks the load and only
     /// surfaces when the server tries to parse it.
     pub fn validate(&self) -> Result<()> {
-        // Owner and staging must agree. Both mismatches are rejected, not
-        // reconciled: filling in a bucket while the owner still says Relyt
-        // would otherwise send the data to Relyt's bucket without a word.
-        match (self.staging_owner, &self.staging) {
-            (StagingOwner::Customer, None) => {
-                return Err(Error::Config(
-                    "staging_owner is Customer but ClientConfig::staging is not set; supply \
-                     endpoint, bucket, prefix, credentials (and region for MinIO/R2), or \
-                     leave staging_owner at its default to use the Relyt-managed bucket"
-                        .into(),
-                ))
-            }
-            (StagingOwner::Relyt, Some(_)) => {
-                return Err(Error::Config(
-                    "ClientConfig::staging is set but staging_owner is Relyt (the default), \
-                     which fetches the bucket from the server and would ignore it; set \
-                     staging_owner = StagingOwner::Customer to use your own bucket, or clear \
-                     staging"
-                        .into(),
-                ))
-            }
-            // Relyt mode: the server's answer goes through the same checks in
-            // Client::connect, once it is known.
-            (StagingOwner::Relyt, None) => {}
-            (StagingOwner::Customer, Some(s)) => validate_staging(s)?,
+        // Under Relyt the server's answer goes through the same checks in
+        // Client::connect, once it is known.
+        if let Staging::Customer(s) = &self.staging {
+            validate_staging(s)?;
         }
         match self.csv.delimiter {
             '"' | '\n' | '\r' => {
@@ -510,24 +577,19 @@ impl ClientConfig {
     /// the server. This is the recommended shape -- nothing secret ends up in
     /// your configuration or your repository.
     pub fn new(control_dsn: impl Into<String>) -> Self {
-        Self::with_parts(StagingOwner::Relyt, None, control_dsn)
+        Self::with_staging(Staging::Relyt, control_dsn)
     }
 
     /// A config for your own staging bucket. Everything the client needs must
     /// be spelled out, including a region when the endpoint is not an
-    /// AWS/OSS one the client can derive it from. See [`StagingOwner`] for
+    /// AWS/OSS one the client can derive it from. See [`Staging`] for
     /// how the two modes differ beyond the location.
     pub fn with_customer_staging(staging: StagingConfig, control_dsn: impl Into<String>) -> Self {
-        Self::with_parts(StagingOwner::Customer, Some(staging), control_dsn)
+        Self::with_staging(Staging::Customer(staging), control_dsn)
     }
 
-    fn with_parts(
-        staging_owner: StagingOwner,
-        staging: Option<StagingConfig>,
-        control_dsn: impl Into<String>,
-    ) -> Self {
+    fn with_staging(staging: Staging, control_dsn: impl Into<String>) -> Self {
         Self {
-            staging_owner,
             staging,
             control_dsn: control_dsn.into(),
             rotate_size_bytes: Self::DEFAULT_ROTATE_SIZE,
@@ -602,28 +664,50 @@ mod tests {
     }
 
     #[test]
-    fn staging_owner_and_staging_must_agree() {
-        // Customer mode without a staging config: the client would have
-        // nowhere to upload to.
-        let mut cfg = base();
-        cfg.staging = None;
-        let msg = cfg.validate().expect_err("must be rejected").to_string();
-        assert!(msg.contains("staging_owner is Customer"), "got: {msg}");
-
-        // The dangerous direction: a bucket filled in while the owner is
-        // still the default. Silently ignoring it would send the customer's
-        // data to Relyt's bucket, so it is an error, not a precedence rule.
-        let mut cfg = base();
-        cfg.staging_owner = StagingOwner::Relyt;
-        let msg = cfg.validate().expect_err("must be rejected").to_string();
-        assert!(msg.contains("staging_owner is Relyt"), "got: {msg}");
-
-        // Relyt mode with nothing set is the recommended shape and passes;
-        // the server's answer is validated later, in Client::connect.
+    fn staging_is_one_field_with_two_shapes() {
+        // Relyt mode is the recommended shape and passes as-is; the server's
+        // answer is validated later, in Client::connect.
         let cfg = ClientConfig::new("host=h user=u dbname=d");
-        assert_eq!(cfg.staging_owner, StagingOwner::Relyt);
-        assert!(cfg.staging.is_none());
+        assert!(matches!(cfg.staging, Staging::Relyt));
+        assert!(cfg.staging.customer().is_none());
         cfg.validate().expect("the default shape is valid");
+
+        // Customer mode carries the bucket inside the variant, so "customer
+        // without a bucket" and "bucket under Relyt" cannot be written down.
+        let cfg = base();
+        assert!(cfg.staging.customer().is_some());
+        cfg.validate().expect("a complete customer config is valid");
+    }
+
+    #[test]
+    fn debug_output_redacts_the_dsn_password_in_both_forms() {
+        let mut cfg = ClientConfig::new("host=h user=u password=s3cret dbname=d");
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("s3cret"), "got: {shown}");
+        assert!(shown.contains("password=***"), "got: {shown}");
+        assert!(
+            shown.contains("host=h"),
+            "non-secret parts stay visible: {shown}"
+        );
+
+        cfg.control_dsn = "postgresql://u:s3cret@h:5432/d?sslmode=require".into();
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("s3cret"), "got: {shown}");
+        assert!(
+            shown.contains("postgresql://u:***@h:5432/d"),
+            "got: {shown}"
+        );
+    }
+
+    #[test]
+    fn mask_dsn_handles_quoted_and_missing_passwords() {
+        assert_eq!(
+            mask_dsn("host=h password='a b' user=u"),
+            "host=h password=*** user=u"
+        );
+        assert_eq!(mask_dsn("host=h PASSWORD=x"), "host=h PASSWORD=***");
+        assert_eq!(mask_dsn("host=h user=u"), "host=h user=u");
+        assert_eq!(mask_dsn("postgresql://u@h/d"), "postgresql://u@h/d");
     }
 
     #[test]
@@ -712,7 +796,9 @@ mod tests {
         cfg.bypass_range_checks = true;
         cfg.gc_interval = Duration::from_secs(2); // out of range: tolerated
         cfg.validate().unwrap();
-        cfg.staging.as_mut().unwrap().access_key_id = "with,comma".into(); // structural: still fatal
+        if let Staging::Customer(s) = &mut cfg.staging {
+            s.access_key_id = "with,comma".into(); // structural: still fatal
+        }
         cfg.validate().unwrap_err();
     }
 
@@ -720,6 +806,11 @@ mod tests {
     fn aws_region_derivation() {
         assert_eq!(
             derive_aws_region("s3.ap-east-1.amazonaws.com").as_deref(),
+            Some("ap-east-1")
+        );
+        // A port does not hide the region.
+        assert_eq!(
+            derive_aws_region("s3.ap-east-1.amazonaws.com:443").as_deref(),
             Some("ap-east-1")
         );
         assert_eq!(

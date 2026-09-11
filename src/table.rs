@@ -77,7 +77,7 @@ struct WriterInner {
     serial_group: String,
     cfg: ClientConfig,
     /// The staging location actually in use, resolved once at connect: under
-    /// the default Relyt-managed mode `cfg.staging` is None and this is what
+    /// the default Relyt-managed mode `cfg.staging` names no bucket and this is what
     /// the server handed back. Only the credentials are read here (for the
     /// job options); paths come from `staging_url_base`.
     staging_cfg: StagingConfig,

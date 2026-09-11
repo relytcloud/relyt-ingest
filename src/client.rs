@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{
-    cluster_id_is_unset, connect_control, validate_staging, ClientConfig, StagingConfig,
+    cluster_id_is_unset, connect_control, validate_staging, ClientConfig, Staging, StagingConfig,
     StagingService, StreamMode,
 };
 use crate::error::{Error, Result};
@@ -21,8 +21,8 @@ pub struct Client {
     cfg: ClientConfig,
     /// The staging location actually in use: either the customer's own config
     /// or what the server handed back. Everything downstream reads this, not
-    /// `cfg.staging`, which is only the customer's input and is None under the
-    /// default Relyt-managed mode.
+    /// `cfg.staging`, which under the default Relyt-managed mode names no
+    /// bucket at all.
     staging_cfg: StagingConfig,
     staging: StagingStore,
     control: tokio_postgres::Client,
@@ -37,7 +37,7 @@ impl Client {
     /// Establish staging access and the Relyt control connection, resolve the
     /// cluster identity, and start the background notify task.
     ///
-    /// Under the default [`crate::StagingOwner::Relyt`] the staging location and its
+    /// Under the default [`crate::Staging::Relyt`] the staging location and its
     /// credentials are fetched here, so the control connection must be up
     /// before staging access exists -- the reverse of the customer-owned
     /// order, where both are known from the config.
@@ -54,7 +54,7 @@ impl Client {
         let staging = StagingStore::new(&staging_cfg)?;
         let cluster_id = resolve_cluster_id(&cfg, &control).await?;
         tracing::info!(
-            staging_owner = ?cfg.staging_owner,
+            staging = staging_kind(&cfg.staging),
             endpoint = %staging_cfg.endpoint,
             bucket = %staging_cfg.bucket,
             prefix = %staging_cfg.prefix,
@@ -389,26 +389,46 @@ fn parse_staging_url(
     } else {
         StagingService::S3
     };
-    Ok(StagingConfig {
+    let staging = StagingConfig {
         endpoint: endpoint.to_string(),
         bucket: bucket.to_string(),
         prefix: prefix.trim_matches('/').to_string(),
         access_key_id,
         secret_access_key,
         service,
-        // Left to derive_aws_region: a Relyt-managed bucket is on OSS (which
-        // needs no region) or on AWS (whose endpoint carries it). A store
-        // with an opaque endpoint is only reachable in customer-owned mode,
-        // where the region is configured directly.
+        // The server hands out a location, never a region: a Relyt-managed
+        // bucket is expected on OSS (needs none) or on AWS (the endpoint
+        // carries it), and derive_aws_region recovers the latter.
         region: None,
-    })
+    };
+    // Anything else cannot be signed, and under Relyt-managed staging the
+    // customer has no field to fix that with -- so say who can, rather than
+    // pointing at StagingConfig.region as the customer-owned check does.
+    if staging.service == StagingService::S3 && staging.resolve_region().is_none() {
+        return Err(Error::Config(format!(
+            "the staging url the Relyt master handed out (`{url}`) is on an S3-compatible \
+             store whose region cannot be derived from its host; Relyt-managed staging \
+             supports `*.aliyuncs.com` and `*.amazonaws.com(.cn)` endpoints. Ask the Relyt \
+             administrator to provision one of those, or use your own bucket through \
+             Staging::Customer(..) with an explicit region"
+        )));
+    }
+    Ok(staging)
+}
+
+/// Log-friendly name of the staging variant (the config itself is logged
+/// field by field right after, credentials masked).
+fn staging_kind(s: &Staging) -> &'static str {
+    match s {
+        Staging::Relyt => "Relyt",
+        Staging::Customer(_) => "Customer",
+    }
 }
 
 /// Resolve the staging location: the customer's own config when they supplied
 /// one, otherwise the server's `relyt_get_ingest_staging_config()`.
 ///
-/// The two are mutually exclusive and `ClientConfig::validate` has already
-/// rejected the mismatches, so this only has to act on the owner. Whatever
+/// The variant alone decides; there is no owner flag to cross-check. Whatever
 /// comes back goes through the same structural checks as a customer-supplied
 /// config -- an operator can mis-provision a GUC as easily as a customer can
 /// mis-write a config file.
@@ -416,7 +436,7 @@ async fn resolve_staging(
     cfg: &ClientConfig,
     control: &tokio_postgres::Client,
 ) -> Result<StagingConfig> {
-    if let Some(s) = &cfg.staging {
+    if let Staging::Customer(s) = &cfg.staging {
         return Ok(s.clone());
     }
     let row = control
@@ -431,7 +451,7 @@ async fn resolve_staging(
                 Error::Config(
                     "this server has no relyt_get_ingest_staging_config(): it predates \
                      Relyt-managed ingest staging. Upgrade the instance, or set \
-                     staging_owner = StagingOwner::Customer with your own bucket."
+                     Staging::Customer(..) with your own bucket."
                         .into(),
                 )
             } else if is_insufficient_privilege(&e) {
@@ -635,6 +655,33 @@ mod tests {
             parse_staging_url("s3://s3.amazonaws.com/b/a/b/c", "ak".into(), "sk".into()).unwrap();
         assert_eq!(c.bucket, "b");
         assert_eq!(c.prefix, "a/b/c");
+    }
+
+    #[test]
+    fn staging_url_with_a_port_or_an_opaque_host() {
+        // A port hides neither the store kind nor the region.
+        let c = parse_staging_url(
+            "s3://oss-cn-hangzhou.aliyuncs.com:443/b/p",
+            "ak".into(),
+            "sk".into(),
+        )
+        .unwrap();
+        assert_eq!(c.service, StagingService::Oss);
+        let c = parse_staging_url(
+            "s3://s3.ap-east-1.amazonaws.com:443/b",
+            "ak".into(),
+            "sk".into(),
+        )
+        .unwrap();
+        assert_eq!(c.resolve_region().as_deref(), Some("ap-east-1"));
+
+        // An S3-compatible store the client cannot sign for: the error names
+        // the administrator, not a field that does not exist in managed mode.
+        let err = parse_staging_url("s3://minio.internal:9000/b/p", "ak".into(), "sk".into())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Relyt administrator"), "got: {err}");
+        assert!(!err.contains("StagingConfig.region"), "got: {err}");
     }
 
     #[test]

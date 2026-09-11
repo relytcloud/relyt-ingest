@@ -68,8 +68,8 @@ crate 发布在 crates.io，API 文档在 docs.rs。arrow 与 Rust 版本约束�
 | 区域 | Relyt 保证与实例同区 | 你需保证与 Relyt 实例同云同区域，服务端要直连读取 |
 | 安全姿态 | 你的人与配置系统不接触密钥 | **你的密钥必然到达 Relyt 服务端**：Relyt master 装载时必须能读你写入的对象，凭证会随装载任务传给它并落入作业记录。这一点与默认模式不同，请知悉后再选择 |
 
-两者互斥且会在 `Client::connect` 交叉校验：默认模式下填了 `staging` 会报错而不是
-被忽略——否则"填了自己的桶却忘了切换归属"会让数据静默写进 Relyt 的桶。
+两者是同一个字段 `staging` 的两个取值（`Staging::Relyt` 与 `Staging::Customer(..)`），
+"填了自己的桶却忘了切换归属"这种中间状态在类型上就不存在。
 
 ```rust
 // 默认：无需任何凭证
@@ -270,8 +270,7 @@ with time zone`、`integer`、`bigint`、`double`、`date`、`boolean`、`smalli
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `staging_owner` | `Relyt` | 桶归属。默认由服务端提供桶与凭证；`Customer` 表示自备桶，此时 `staging` 必填。见「staging 桶归属」 |
-| `staging`（endpoint/bucket/prefix/AK/SK/service/region） | `None` | 仅自备桶模式需要；`region` 仅 MinIO/R2 等非 AWS 端点需要显式填。默认模式下填了会报错 |
+| `staging` | `Staging::Relyt` | 桶来源。默认由服务端提供桶与凭证；`Staging::Customer(StagingConfig { endpoint/bucket/prefix/AK/SK/service/region })` 表示自备桶，`region` 仅 MinIO/R2 等非 AWS 端点需要显式填。见「staging 桶归属」 |
 | `control_dsn` | 必填 | Relyt 控制连接串（仅元数据与通知，不走行数据） |
 | `stream_mode` | `Upsert` | 有主键表用 `Upsert`（同 key 终值=最后一次写入）；无主键表用 `InsertOnly`（重复行原样保留）。**同一张表的所有 writer 必须同模式**；切换模式前需停写排空 |
 | `staging_compression` | `Gzip` | staged CSV 文件 gzip 压缩后上传（对象名 `.csv.gz`），上传带宽与 staging 存储约降 5~10 倍；Relyt 服务端按文件内容自动识别并解压，**无需任何服务端配置**。设为 `Plain` 得到可直接下载阅读的明文 `.csv`（排障时有用）。攒批阈值始终按压缩前的 CSV 大小判定 |
