@@ -1,0 +1,68 @@
+# Continuous integration for relyt-ingest.
+#
+# Three jobs, each answering one question:
+#   test    -- does the crate build, pass its unit and doc tests, and document
+#              cleanly on the toolchain we develop with (rust-toolchain.toml)?
+#   msrv    -- does it still build on the floor Cargo.toml promises consumers
+#              (rust-version = 1.85)? cargo hard-errors below that floor, so
+#              every notch we declare is a notch a consumer is forced to have.
+#   package -- would `cargo publish` accept it as-is (packaging, metadata,
+#              the verify build of the packaged tree)?
+#
+# The toolchain is selected by rust-toolchain.toml; `rustup show` installs it on
+# the runner. The MSRV job overrides that file through RUSTUP_TOOLCHAIN.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: fmt, build, test, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo build --locked --lib --examples
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --doc
+      - name: rustdoc, with broken intra-doc links as errors
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: build on MSRV (1.85)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the MSRV toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --lib --examples
+
+  package:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run --locked
