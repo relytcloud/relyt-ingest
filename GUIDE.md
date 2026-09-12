@@ -101,7 +101,11 @@ let cfg = ClientConfig::with_customer_staging(
 **默认（Relyt 托管）模式下你不持有 staging 凭证**，本节只剩 DSN 一项要保管：
 不要把 DSN 写死在源码或配置仓库里，推荐 K8s Secret 注入环境变量、Secret 挂载为
 0400 文件，或启动时从密钥管理服务（阿里云 KMS 凭据管家 / AWS Secrets Manager）
-拉取。轮转 staging 密钥由 Relyt 侧完成，你无需改配置、也无需重启。
+拉取。轮转 staging 密钥由 Relyt 侧完成，**你无需改配置、也无需重启**：SDK 每
+5 分钟（`staging_refresh_interval`）向 Relyt master 重新获取一次凭证，上传被拒
+（403）时也会立即刷新并重试一次；排在队列里尚未提交的通知在提交时才带上当时
+有效的凭证。Relyt 侧轮转时会让旧密钥继续有效至少 24 小时，覆盖刷新周期与在途
+装载任务的重试期。
 
 自备桶模式下，以下几点由你负责：
 
@@ -296,6 +300,7 @@ with time zone`、`integer`、`bigint`、`double`、`date`、`boolean`、`smalli
 | `gc_interval` / `gc_retain_days` / `gc_retain_min_files` | 1h / 7 天 / 5 万 | staging 上已消费文件的自动清理节奏与保留底线 |
 | `lock_heartbeat_interval` / `lock_lease_timeout` | 30s / 180s | writer 租约的心跳与接管时限（就是上文"约 3 分钟自动接管"的来源），详见下方说明 |
 | `csv.delimiter` | `,` | CSV 列分隔符，与服务端约定一致，无需修改 |
+| `staging_refresh_interval` | 5min | 托管模式下重新获取 staging 凭证的周期（上传 403 时另会立即刷新）；自备桶模式忽略 |
 
 **关于租约两参数**：它们只服务于"同一 writer_id 同时只有一个进程"的保护，
 **不在数据路径上，不影响数据可见延迟**——心跳是独立后台任务，append/flush/
@@ -340,7 +345,7 @@ SDK 用 `tracing` 输出结构化日志（接任意 tracing subscriber 即可采
 |---|---|---|---|
 | Kafka consumer lag | Kafka 侧标准监控（consumer group lag） | 按业务容忍度 | 消费跟不上生产：SDK 进程算力/网络不足，或进程挂了 |
 | 持久化滞后 = consumer 当前 offset − `writer.staged_offset()` | 应用内周期采集（如每 30s 导出到监控系统） | 折算时间 > 3 × `rotate_interval_max`（默认即 ~45 秒）持续 2 个采集周期 | 攒批或上传不畅：staging 网络/凭证问题，或单批过大 |
-| **装载滞后 `lag_seconds`**（SDK 内置）= 最老未装载文件的年龄 | `writer.lag()`（后台每 30s 采样一次服务端水位；文件清单每 5 分钟刷新一次，两次刷新之间 `lag_files` 不计入新切出的文件）导出到监控系统；SDK 同时每 ~5 分钟打一行状态心跳日志 | > 120 秒持续 2 个采样 | 服务端装载不畅（含装载失败文件卡队头——此时该值持续增长） |
+| **装载滞后 `lag_seconds`**（SDK 内置）= 最老未装载文件的年龄 | `writer.lag()`（后台每 30s 通过一条常驻连接采样一次服务端水位，与本进程已切出、尚未被水位覆盖的文件清单相减；新切出的文件立即计入，进程重启后由恢复阶段的目录清单补齐）导出到监控系统；SDK 同时每 ~5 分钟打一行状态心跳日志 | > 120 秒持续 2 个采样 | 服务端装载不畅（含装载失败文件卡队头——此时该值持续增长） |
 | 端到端可见延迟 = now − 表内最新事件时间 | 若表有事件时间列，查询侧探针 `SELECT max(event_time)`（低频，如每分钟） | > 5 × (`rotate_interval_max` + 1 分钟) | 全链路健康的最终裁决，覆盖服务端装载段 |
 
 **必须立即告警的两个状态**（不是滞后，是流已停止，需人工介入）：

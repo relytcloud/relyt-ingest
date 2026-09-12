@@ -5,6 +5,8 @@
 //! All keys derive from a [`WriterIdentity`]; the layout contract lives in
 //! [`crate::naming`]'s module docs.
 
+use std::sync::{Arc, RwLock};
+
 use opendal::{services, Operator};
 
 use crate::config::{StagingConfig, StagingService};
@@ -53,7 +55,7 @@ impl StagingStore {
 
     /// Whole-object write. Same key + same bytes on retry — no .tmp+rename,
     /// no multipart bookkeeping needed at these sizes (<=64MB).
-    pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, key: &str, bytes: impl Into<opendal::Buffer>) -> Result<()> {
         self.op.write(key, bytes).await?;
         Ok(())
     }
@@ -179,5 +181,141 @@ mod tests {
         assert_eq!(normalize_root(""), "/");
         assert_eq!(normalize_root("/staging/"), "/staging/");
         assert_eq!(normalize_root("a/b"), "/a/b/");
+    }
+}
+
+/// `s3://<endpoint>/<bucket>[/<prefix>]` -- the url form the Relyt master's
+/// loader consumes; every staged object url is `<base>/<key>`.
+pub fn staging_url_base(cfg: &StagingConfig) -> String {
+    let scheme = match cfg.service {
+        StagingService::Oss | StagingService::S3 => "s3",
+    };
+    let prefix = cfg.prefix.trim_matches('/');
+    if prefix.is_empty() {
+        format!("{scheme}://{}/{}", cfg.endpoint, cfg.bucket)
+    } else {
+        format!("{scheme}://{}/{}/{prefix}", cfg.endpoint, cfg.bucket)
+    }
+}
+
+/// One immutable snapshot of the staging location: the config, the store
+/// built from it, and the url base every object url derives from. Handed out
+/// by [`StagingHandle::current`], used for one operation, never mutated.
+pub struct StagingLive {
+    pub cfg: StagingConfig,
+    pub store: StagingStore,
+    pub url_base: String,
+}
+
+impl StagingLive {
+    fn build(cfg: StagingConfig) -> Result<Self> {
+        let store = StagingStore::new(&cfg)?;
+        let url_base = staging_url_base(&cfg);
+        Ok(Self {
+            cfg,
+            store,
+            url_base,
+        })
+    }
+}
+
+/// The staging location in use, swappable at run time.
+///
+/// Under Relyt-managed staging the credentials come from the master and the
+/// master's operator rotates them; a long-running writer must pick the new
+/// pair up without a restart. `current()` returns the live snapshot and
+/// `apply()` installs a fresh config when its credentials differ. Only the
+/// credentials may change: bucket and prefix are baked into every path and
+/// identifier this process has already published, so a different location is
+/// refused (the old snapshot stays) and needs a restart.
+///
+/// `std::sync::RwLock` on purpose: the guard is released before any await --
+/// callers clone the Arc out -- matching the crate's lock discipline.
+pub struct StagingHandle {
+    live: RwLock<Arc<StagingLive>>,
+    /// The control DSN to re-fetch credentials with under Relyt-managed
+    /// staging; None for a customer-owned bucket, whose credentials are static
+    /// configuration and never refreshed.
+    managed_dsn: Option<String>,
+}
+
+impl StagingHandle {
+    pub fn new(cfg: StagingConfig, managed_dsn: Option<String>) -> Result<Self> {
+        Ok(Self {
+            live: RwLock::new(Arc::new(StagingLive::build(cfg)?)),
+            managed_dsn,
+        })
+    }
+
+    pub fn current(&self) -> Arc<StagingLive> {
+        self.live.read().unwrap().clone()
+    }
+
+    /// The control DSN when credentials are Relyt-managed, None otherwise.
+    pub fn managed_dsn(&self) -> Option<&str> {
+        self.managed_dsn.as_deref()
+    }
+
+    /// Install `fresh` if its credentials differ from the live snapshot.
+    /// `Ok(true)` = swapped, `Ok(false)` = nothing changed, `Err` = `fresh`
+    /// names a different location, which is refused.
+    pub fn apply(&self, fresh: StagingConfig) -> Result<bool> {
+        let cur = self.current();
+        if fresh.endpoint != cur.cfg.endpoint
+            || fresh.bucket != cur.cfg.bucket
+            || fresh.prefix != cur.cfg.prefix
+            || fresh.service != cur.cfg.service
+        {
+            return Err(Error::Config(format!(
+                "staging location changed on the server (was `{}`, now `{}`); bucket and \
+                 prefix are fixed for the life of a process, restart the writer to move",
+                cur.url_base,
+                staging_url_base(&fresh)
+            )));
+        }
+        if fresh.access_key_id == cur.cfg.access_key_id
+            && fresh.secret_access_key == cur.cfg.secret_access_key
+            && fresh.region == cur.cfg.region
+        {
+            return Ok(false);
+        }
+        let live = Arc::new(StagingLive::build(fresh)?);
+        *self.live.write().unwrap() = live;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    fn cfg(ak: &str, prefix: &str) -> StagingConfig {
+        StagingConfig {
+            endpoint: "oss-cn-hangzhou.aliyuncs.com".into(),
+            bucket: "b".into(),
+            prefix: prefix.into(),
+            access_key_id: ak.into(),
+            secret_access_key: "sk".into(),
+            service: StagingService::Oss,
+            region: None,
+        }
+    }
+
+    #[test]
+    fn apply_swaps_credentials_but_refuses_a_new_location() {
+        let h = StagingHandle::new(cfg("ak1", "p"), Some("host=h".into())).unwrap();
+        assert_eq!(
+            h.current().url_base,
+            "s3://oss-cn-hangzhou.aliyuncs.com/b/p"
+        );
+        assert!(
+            !h.apply(cfg("ak1", "p")).unwrap(),
+            "same credentials: no swap"
+        );
+        assert!(h.apply(cfg("ak2", "p")).unwrap(), "new key: swapped");
+        assert_eq!(h.current().cfg.access_key_id, "ak2");
+        let err = h.apply(cfg("ak3", "other")).unwrap_err().to_string();
+        assert!(err.contains("location changed"), "got {err}");
+        assert_eq!(h.current().cfg.access_key_id, "ak2", "old snapshot kept");
     }
 }

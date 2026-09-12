@@ -32,14 +32,14 @@ use arrow_array::RecordBatch;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{ClientConfig, StagingCompression, StagingConfig, StreamMode};
+use crate::config::{ClientConfig, StagingCompression, StreamMode};
 use crate::csv::CsvFormatter;
 use crate::dedup::dedup_last_wins;
 use crate::error::{Error, Result};
 use crate::naming::{StagedFile, WriterIdentity};
-use crate::notify::{build_copy_options, Notifier, NotifyRequest};
+use crate::notify::{Notifier, NotifyRequest};
 use crate::schema::TableSchema;
-use crate::staging::StagingStore;
+use crate::staging::{StagingHandle, StagingStore};
 use crate::state::{StateFile, STATE_VERSION};
 
 pub struct TableWriter {
@@ -76,14 +76,13 @@ struct WriterInner {
     names: (String, String, String),
     serial_group: String,
     cfg: ClientConfig,
-    /// The staging location actually in use, resolved once at connect: under
-    /// the default Relyt-managed mode `cfg.staging` names no bucket and this is what
-    /// the server handed back. Only the credentials are read here (for the
-    /// job options); paths come from `staging_url_base`.
-    staging_cfg: StagingConfig,
-    staging: StagingStore,
+    /// The staging location actually in use -- the customer's own bucket or
+    /// what the master handed back -- as a swappable handle: under
+    /// Relyt-managed staging the credentials inside it are refreshed while
+    /// this writer runs. Every operation takes the snapshot current at that
+    /// moment (`store()` / `url_base()`).
+    staging: Arc<StagingHandle>,
     notifier: Arc<Notifier>,
-    staging_url_base: String,
     /// This process's lease identity (`lock.rs`); the heartbeat task renews
     /// `_meta/.../lock` under it and fences the writer if the lock is lost.
     instance_uuid: String,
@@ -129,6 +128,11 @@ struct WriterState {
     /// the rotation lock; a failed rotation does NOT return its seq — the
     /// hole is harmless, reuse could bind two files to one seq.
     next_seq: u32,
+    /// Every file this writer knows to be staged and not yet consumed, as
+    /// (serial_seq, epoch_ms): seeded from the recovery listing at open, one
+    /// entry appended per rotation, pruned by the lag sampler as the server
+    /// watermark passes them. The lag numbers are computed from this list.
+    known_files: Vec<(i64, u64)>,
     /// Rows currently buffered (for the CSV-byte size estimate).
     buffered_rows: usize,
     /// Average CSV bytes per surviving row, measured on the last rotation.
@@ -154,13 +158,12 @@ impl TableWriter {
         ident: WriterIdentity,
         names: (String, String, String),
         cfg: ClientConfig,
-        staging_cfg: StagingConfig,
-        staging: StagingStore,
+        staging: Arc<StagingHandle>,
         notifier: Arc<Notifier>,
-        staging_url_base: String,
         initial_epoch_ms: u64,
         staged_offset: Option<i64>,
         resume_persisted: Option<i64>,
+        known_files: Vec<(i64, u64)>,
         instance_uuid: String,
     ) -> Self {
         let serial_group = ident.serial_group();
@@ -175,6 +178,7 @@ impl TableWriter {
                 next_seq: 0,
                 staged_offset,
                 resume_persisted,
+                known_files,
                 state_written_at: Instant::now(),
             }),
             schema,
@@ -182,10 +186,8 @@ impl TableWriter {
             names,
             serial_group,
             cfg,
-            staging_cfg,
             staging,
             notifier,
-            staging_url_base,
             instance_uuid,
             fenced: std::sync::Mutex::new(None),
             lag: std::sync::Mutex::new(None),
@@ -318,9 +320,9 @@ impl TableWriter {
         self.inner.rotate().await?;
         self.inner.persist_state_if_due().await;
         let staged = self.inner.state.lock().await.staged_offset;
-        if let Ok(Some(l)) = self.inner.staging.read_lock(&self.inner.ident).await {
+        if let Ok(Some(l)) = self.inner.store().read_lock(&self.inner.ident).await {
             if l.instance_uuid == self.inner.instance_uuid {
-                let _ = self.inner.staging.delete_lock(&self.inner.ident).await;
+                let _ = self.inner.store().delete_lock(&self.inner.ident).await;
             }
         }
         tracing::info!(
@@ -333,6 +335,16 @@ impl TableWriter {
 }
 
 impl WriterInner {
+    /// The store of the staging snapshot current right now.
+    fn store(&self) -> StagingStore {
+        self.staging.current().store.clone()
+    }
+
+    /// The url base of the staging snapshot current right now.
+    fn url_base(&self) -> String {
+        self.staging.current().url_base.clone()
+    }
+
     fn is_fenced(&self) -> bool {
         self.fenced.lock().unwrap().is_some()
     }
@@ -429,11 +441,12 @@ impl WriterInner {
             Some(prev) => prev.max(file.end_offset),
             None => file.end_offset,
         });
+        st.known_files.push((serial_seq, file.epoch_ms));
         tracing::info!(
             db = %self.names.0,
             table = %format!("{}.{}", self.names.1, self.names.2),
             writer_id = %self.ident.writer_id,
-            object = %format!("{}/{}", self.staging_url_base, object_key),
+            object = %format!("{}/{}", self.url_base(), object_key),
             start_offset = file.start_offset,
             end_offset = file.end_offset,
             rows = staged_stats.rows,
@@ -452,14 +465,10 @@ impl WriterInner {
             serial_group: self.serial_group.clone(),
             end_offset: file.end_offset,
             identifier,
-            source_url: format!("{}/{}", self.staging_url_base, object_key),
+            source_url: format!("{}/{}", self.url_base(), object_key),
             target: self.ident.rel_oid,
-            options: build_copy_options(
-                &self.staging_cfg.access_key_id,
-                &self.staging_cfg.secret_access_key,
-                self.cfg.csv.delimiter,
-                self.cfg.stream_mode == StreamMode::Upsert,
-            ),
+            delimiter: self.cfg.csv.delimiter,
+            upsert: self.cfg.stream_mode == StreamMode::Upsert,
             serial_seq,
             retry_max: self.cfg.retry_max.or(Some(-1)),
         })?;
@@ -531,7 +540,22 @@ impl WriterInner {
             body.into_bytes()
         };
         let stored_bytes = payload.len();
-        self.staging.put(object_key, payload).await?;
+        // Buffer, not Vec: a retry after a credential refresh needs the bytes
+        // again, and a Buffer clone is a reference count, not a copy.
+        let payload = opendal::Buffer::from(payload);
+        if let Err(e) = self.store().put(object_key, payload.clone()).await {
+            // A denied upload under Relyt-managed staging is most likely a key
+            // the master has since rotated: refresh once, and retry once only
+            // if that produced a different key. Anything else propagates.
+            let denied =
+                matches!(&e, Error::Storage(s) if s.kind() == opendal::ErrorKind::PermissionDenied);
+            if !(denied
+                && crate::client::refresh_managed_staging(&self.staging, "upload denied").await?)
+            {
+                return Err(e);
+            }
+            self.store().put(object_key, payload).await?;
+        }
         Ok(StageStats {
             rows: kept_rows,
             bytes,
@@ -616,7 +640,7 @@ impl WriterInner {
         if self.is_fenced() {
             return;
         }
-        match self.staging.write_state(&self.ident, &state).await {
+        match self.store().write_state(&self.ident, &state).await {
             Ok(()) => {
                 let mut st = self.state.lock().await;
                 st.resume_persisted = resume;
@@ -679,7 +703,7 @@ impl WriterInner {
             }
         };
 
-        let (mut staged, unknown) = match self.staging.list_staged(&self.ident).await {
+        let (mut staged, unknown) = match self.store().list_staged(&self.ident).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "gc: LIST failed, skipping this pass");
@@ -720,7 +744,7 @@ impl WriterInner {
 
         let mut deleted = 0usize;
         for f in &deletable {
-            match self.staging.delete_staged(&self.ident, f).await {
+            match self.store().delete_staged(&self.ident, f).await {
                 Ok(()) => deleted += 1,
                 Err(e) => {
                     tracing::warn!(error = %e, "gc: delete failed, stopping this pass");
@@ -868,8 +892,9 @@ mod tests {
             staging_cfg.clone(),
             "host=127.0.0.1 port=1 user=nobody dbname=nobody",
         );
-        let staging = StagingStore::new(&staging_cfg).expect("build staging store");
-        let notifier = Arc::new(Notifier::spawn(cfg.control_dsn.clone()));
+        let staging =
+            Arc::new(StagingHandle::new(staging_cfg, None).expect("build staging handle"));
+        let notifier = Arc::new(Notifier::spawn(cfg.control_dsn.clone(), staging.clone()));
         TableWriter::new(
             table_schema,
             WriterIdentity {
@@ -880,13 +905,12 @@ mod tests {
             },
             ("d".into(), "public".into(), "t".into()),
             cfg,
-            staging_cfg,
             staging,
             notifier,
-            "s3://oss-example.aliyuncs.com/b/p".into(),
             1,
             None,
             None,
+            Vec::new(),
             "test-instance".into(),
         )
     }
@@ -981,9 +1005,9 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
                 Some(i) => i,
                 None => {
                     // Writer dropped: release the lease iff still ours.
-                    if let Ok(Some(l)) = staging.read_lock(&ident).await {
+                    if let Ok(Some(l)) = staging.current().store.read_lock(&ident).await {
                         if l.instance_uuid == me {
-                            let _ = staging.delete_lock(&ident).await;
+                            let _ = staging.current().store.delete_lock(&ident).await;
                         }
                     }
                     return;
@@ -993,11 +1017,11 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
             if since_beat < period {
                 continue;
             }
-            match staging.read_lock(&ident).await {
+            match staging.current().store.read_lock(&ident).await {
                 Ok(Some(l)) if l.instance_uuid == me => {
                     let mut renewed = l;
                     renewed.heartbeat_at_ms = crate::lock::now_ms();
-                    match staging.write_lock(&ident, &renewed).await {
+                    match staging.current().store.write_lock(&ident, &renewed).await {
                         Ok(()) => {
                             last_verified = Instant::now();
                             since_beat = Duration::ZERO;
@@ -1064,15 +1088,18 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
     });
 }
 
-/// Consumption-lag sampler (GUIDE.md "消费延迟监控"): every ~30s, read the
-/// server group watermark and publish a [`LagSnapshot`] through
-/// [`TableWriter::lag`]. The staging-dir LIST that feeds `lag_files` is the
-/// expensive half (the directory is deliberately kept at tens of thousands
-/// of objects), so it is refreshed only every `lag_list_interval` (~5min)
-/// and reused in between -- `lag_seconds` still moves with every watermark
-/// sample because it is recomputed against the fresh watermark. Every 10th
-/// sample (~5min) also logs a one-line status heartbeat. Sampling failures
-/// only skip the round — this task can never affect the data path.
+/// Consumption-lag sampler (GUIDE.md "消费延迟监控"): every `lag_sample_interval`
+/// (~30s), read the server group watermark over one long-lived control
+/// connection and publish a [`LagSnapshot`] through [`TableWriter::lag`].
+///
+/// The numbers come from the writer's own record of what it staged
+/// (`WriterState::known_files`, seeded from the recovery listing at open and
+/// extended by every rotation) minus what the watermark says is consumed. No
+/// directory listing is involved, so a file stuck at the head of the group is
+/// visible at the very next sample rather than after the next listing. Every
+/// 10th sample (~5min) also logs a one-line status heartbeat. A failed sample
+/// only skips the round (and drops the connection for a reconnect); this
+/// task can never affect the data path.
 fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
     const LOG_EVERY_N: u32 = 10;
     let weak: Weak<WriterInner> = Arc::downgrade(inner);
@@ -1082,7 +1109,10 @@ fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval.tick().await; // immediate first tick: skip
         let mut rounds = 0u32;
-        let mut listed: Option<(Instant, Vec<crate::naming::StagedFile>)> = None;
+        // One connection for the life of the sampler, re-opened after any
+        // failure. A fresh connection per sample cost the master a backend
+        // fork every 30s per writer.
+        let mut control: Option<tokio_postgres::Client> = None;
         loop {
             interval.tick().await;
             let inner: Arc<WriterInner> = match Weak::upgrade(&weak) {
@@ -1095,72 +1125,44 @@ fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
             }
             rounds += 1;
 
-            // Fresh short-lived connection per sample: 2 queries / 30s is
-            // negligible, and there is no connection state to babysit.
-            let watermark: Option<i64> =
+            if control.is_none() {
                 match crate::config::connect_control(&inner.cfg.control_dsn).await {
                     Ok((c, conn)) => {
                         tokio::spawn(conn);
-                        match c
-                            .query_one(
-                                "SELECT pg_catalog.relyt_get_serial_group_watermark($1)",
-                                &[&inner.serial_group],
-                            )
-                            .await
-                        {
-                            Ok(row) => row.get(0),
-                            Err(e) => {
-                                tracing::warn!(error = %e, group = %inner.serial_group,
-                                "lag sample: watermark query failed, skipping round");
-                                continue;
-                            }
-                        }
+                        control = Some(c);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, group = %inner.serial_group,
-                        "lag sample: control connection failed, skipping round");
-                        continue;
-                    }
-                };
-
-            // Re-LIST only when the previous listing has aged past
-            // lag_list_interval (30s full listings of a
-            // 50k-object directory were ~6000 requests/hour per writer).
-            let stale = listed
-                .as_ref()
-                .map(|(at, _)| at.elapsed() >= inner.cfg.lag_list_interval)
-                .unwrap_or(true);
-            if stale {
-                match inner.staging.list_staged(&inner.ident).await {
-                    Ok((staged, _)) => listed = Some((Instant::now(), staged)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, group = %inner.serial_group,
-                            "lag sample: staging LIST failed, skipping round");
+                            "lag sample: control connection failed, skipping round");
                         continue;
                     }
                 }
             }
-            let staged = &listed.as_ref().expect("listing refreshed above").1;
+            let watermark: Option<i64> = match control
+                .as_ref()
+                .expect("connected above")
+                .query_one(
+                    "SELECT pg_catalog.relyt_get_serial_group_watermark($1)",
+                    &[&inner.serial_group],
+                )
+                .await
+            {
+                Ok(row) => row.get(0),
+                Err(e) => {
+                    tracing::warn!(error = %e, group = %inner.serial_group,
+                        "lag sample: watermark query failed, reconnecting next round");
+                    control = None;
+                    continue;
+                }
+            };
 
             let now_ms = crate::lock::now_ms();
-            let mut lag_files = 0usize;
-            let mut oldest_epoch: Option<u64> = None;
-            for f in staged.iter() {
-                let Ok(seq) = f.serial_seq() else { continue };
-                if watermark.map(|w| seq > w).unwrap_or(true) {
-                    lag_files += 1;
-                    oldest_epoch = Some(match oldest_epoch {
-                        Some(o) => o.min(f.epoch_ms),
-                        None => f.epoch_ms,
-                    });
-                }
-            }
-            let lag_seconds = oldest_epoch
-                .map(|e| now_ms.saturating_sub(e) / 1000)
-                .unwrap_or(0);
-            let (buffered_age_seconds, staged_offset, buffered_rows) = {
-                let st = inner.state.lock().await;
+            let (lag_files, lag_seconds, buffered_age_seconds, staged_offset, buffered_rows) = {
+                let mut st = inner.state.lock().await;
+                let (files, secs) = lag_of(&mut st.known_files, watermark, now_ms);
                 (
+                    files,
+                    secs,
                     st.oldest_buffered_at
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(0),
@@ -1188,4 +1190,37 @@ fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
             }
         }
     });
+}
+
+/// Drop from `known` every file at or below `watermark` (consumed) and
+/// measure what is left: (how many files, age in seconds of the oldest by
+/// its write-time epoch). `None` means the server has consumed nothing yet,
+/// so everything counts.
+fn lag_of(known: &mut Vec<(i64, u64)>, watermark: Option<i64>, now_ms: u64) -> (usize, u64) {
+    known.retain(|(seq, _)| watermark.is_none_or(|w| *seq > w));
+    let oldest = known.iter().map(|(_, epoch)| *epoch).min();
+    (
+        known.len(),
+        oldest.map(|e| now_ms.saturating_sub(e) / 1000).unwrap_or(0),
+    )
+}
+
+#[cfg(test)]
+mod lag_tests {
+    use super::lag_of;
+
+    #[test]
+    fn lag_counts_only_files_above_the_watermark() {
+        let now = 1_000_000_000u64;
+        let mut known = vec![(10, now - 90_000), (11, now - 60_000), (12, now - 5_000)];
+        // Nothing consumed: all three count, the oldest is 90s old.
+        assert_eq!(lag_of(&mut known.clone(), None, now), (3, 90));
+        // Watermark at 11: only seq 12 remains, 5s old, and the others are
+        // pruned from the list for good.
+        assert_eq!(lag_of(&mut known, Some(11), now), (1, 5));
+        assert_eq!(known, vec![(12, now - 5_000)]);
+        // Caught up.
+        assert_eq!(lag_of(&mut known, Some(12), now), (0, 0));
+        assert!(known.is_empty());
+    }
 }

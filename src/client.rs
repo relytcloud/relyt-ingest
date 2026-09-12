@@ -1,6 +1,7 @@
 //! `Client::connect` + `open_table` (delta-rs style entry points).
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{
@@ -10,10 +11,10 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lock::{new_instance_uuid, LockFile};
 use crate::naming::{decode_serial_seq, validate_cluster_id, validate_writer_id, WriterIdentity};
-use crate::notify::{build_copy_options, Notifier, NotifyRequest};
+use crate::notify::{Notifier, NotifyRequest};
 use crate::recovery::{next_epoch, plan_recovery, RecoveryPlan};
 use crate::schema::{fetch_table_schema, split_qualified};
-use crate::staging::StagingStore;
+use crate::staging::{StagingHandle, StagingStore};
 use crate::state::{StateFile, STATE_VERSION};
 use crate::table::TableWriter;
 
@@ -23,8 +24,7 @@ pub struct Client {
     /// or what the server handed back. Everything downstream reads this, not
     /// `cfg.staging`, which under the default Relyt-managed mode names no
     /// bucket at all.
-    staging_cfg: StagingConfig,
-    staging: StagingStore,
+    staging: Arc<StagingHandle>,
     control: tokio_postgres::Client,
     notifier: Arc<Notifier>,
     /// The `<cluster>` staging-path segment, resolved once at connect (see
@@ -51,22 +51,34 @@ impl Client {
         });
 
         let staging_cfg = resolve_staging(&cfg, &control).await?;
-        let staging = StagingStore::new(&staging_cfg)?;
+        // Under Relyt-managed staging the credentials can be re-read from the
+        // master later (rotation); a customer-owned bucket has nothing to
+        // re-read.
+        let managed_dsn = match &cfg.staging {
+            Staging::Relyt => Some(cfg.control_dsn.clone()),
+            Staging::Customer(_) => None,
+        };
+        let staging = Arc::new(StagingHandle::new(staging_cfg, managed_dsn)?);
         let cluster_id = resolve_cluster_id(&cfg, &control).await?;
-        tracing::info!(
-            staging = staging_kind(&cfg.staging),
-            endpoint = %staging_cfg.endpoint,
-            bucket = %staging_cfg.bucket,
-            prefix = %staging_cfg.prefix,
-            service = ?staging_cfg.service,
-            cluster_id = %cluster_id,
-            "staging resolved"
-        );
+        {
+            let live = staging.current();
+            tracing::info!(
+                staging = staging_kind(&cfg.staging),
+                endpoint = %live.cfg.endpoint,
+                bucket = %live.cfg.bucket,
+                prefix = %live.cfg.prefix,
+                service = ?live.cfg.service,
+                cluster_id = %cluster_id,
+                "staging resolved"
+            );
+        }
 
-        let notifier = Arc::new(Notifier::spawn(cfg.control_dsn.clone()));
+        let notifier = Arc::new(Notifier::spawn(cfg.control_dsn.clone(), staging.clone()));
+        if staging.managed_dsn().is_some() {
+            spawn_staging_refresh(&staging, cfg.staging_refresh_interval);
+        }
         Ok(Client {
             cfg,
-            staging_cfg,
             staging,
             control,
             notifier,
@@ -109,14 +121,14 @@ impl Client {
         //    (best-effort — an unreleased lease self-expires after
         //    lock_lease_timeout).
         let instance_uuid = new_instance_uuid();
-        acquire_writer_lease(&self.staging, &ident, &instance_uuid, &self.cfg).await?;
+        acquire_writer_lease(&self.store(), &ident, &instance_uuid, &self.cfg).await?;
         let res = self
             .open_table_locked(table, schema, &ident, &instance_uuid)
             .await;
         if res.is_err() {
-            if let Ok(Some(l)) = self.staging.read_lock(&ident).await {
+            if let Ok(Some(l)) = self.store().read_lock(&ident).await {
                 if l.instance_uuid == instance_uuid {
-                    let _ = self.staging.delete_lock(&ident).await;
+                    let _ = self.store().delete_lock(&ident).await;
                 }
             }
         }
@@ -147,7 +159,7 @@ impl Client {
         //    sharing one prefix WILL collide; the recorded names are the one
         //    executable guard for that deployment rule. A rename (same OIDs,
         //    different name) is legal and only logged.
-        let state = self.staging.read_state(&ident).await?;
+        let state = self.store().read_state(&ident).await?;
         let (schema_name, table_name) = split_qualified(table)?;
         let database: String = self
             .control
@@ -208,7 +220,7 @@ impl Client {
         };
 
         // 4. LIST the writer's staging directory.
-        let (staged, unknown) = self.staging.list_staged(&ident).await?;
+        let (staged, unknown) = self.store().list_staged(&ident).await?;
         for name in &unknown {
             tracing::warn!(file = %name, "unrecognized file under staging prefix (ignored)");
         }
@@ -263,25 +275,22 @@ impl Client {
             writer_id: ident.writer_id.clone(),
             updated_at_ms: now_ms,
         };
-        self.staging.write_state(&ident, &new_state).await?;
+        self.store().write_state(&ident, &new_state).await?;
 
         // 7. Re-notify the backfill through the writer's queue (fast path);
         //    the gate and identifier idempotency swallow anything already
         //    known. Serial fields are unconditional: insert-only runs with
         //    M=1 serialization too, which is what gives it a watermark.
+        let url_base = self.staging.current().url_base.clone();
         for f in &plan.backfill {
             self.notifier.enqueue(NotifyRequest {
                 serial_group: group.clone(),
                 end_offset: f.end_offset,
                 identifier: f.identifier(&ident)?,
-                source_url: format!("{}/{}", self.staging_url_base(), f.object_key(&ident)),
+                source_url: format!("{}/{}", url_base, f.object_key(&ident)),
                 target: ident.rel_oid,
-                options: build_copy_options(
-                    &self.staging_cfg.access_key_id,
-                    &self.staging_cfg.secret_access_key,
-                    self.cfg.csv.delimiter,
-                    self.cfg.stream_mode == StreamMode::Upsert,
-                ),
+                delimiter: self.cfg.csv.delimiter,
+                upsert: self.cfg.stream_mode == StreamMode::Upsert,
                 serial_seq: f.serial_seq()?,
                 retry_max: self.cfg.retry_max.or(Some(-1)),
             })?;
@@ -298,16 +307,20 @@ impl Client {
             ident,
             names,
             self.cfg.clone(),
-            self.staging_cfg.clone(),
             self.staging.clone(),
             self.notifier.clone(),
-            self.staging_url_base(),
             epoch,
             staged_offset,
             // Seed the in-process "last persisted resume_offset" with what
             // state.json already records, so an idle writer's periodic state
             // heartbeat re-writes that value instead of None.
             new_state.resume_offset,
+            // What recovery found staged above the watermark: the lag sampler
+            // starts from this list and appends every later rotation.
+            plan.backfill
+                .iter()
+                .filter_map(|f| f.serial_seq().ok().map(|s| (s, f.epoch_ms)))
+                .collect(),
             instance_uuid.to_string(),
         );
         // The one-line restart audit trail: everything recovery decided.
@@ -322,26 +335,6 @@ impl Client {
             "open_table recovery complete"
         );
         Ok((writer, plan))
-    }
-
-    /// `s3://<endpoint>/<bucket>[/<prefix>]` — the URL form the Relyt master's
-    /// loader consumes.
-    fn staging_url_base(&self) -> String {
-        let scheme = match self.staging_cfg.service {
-            StagingService::Oss | StagingService::S3 => "s3",
-        };
-        let prefix = self.staging_cfg.prefix.trim_matches('/');
-        if prefix.is_empty() {
-            format!(
-                "{scheme}://{}/{}",
-                self.staging_cfg.endpoint, self.staging_cfg.bucket
-            )
-        } else {
-            format!(
-                "{scheme}://{}/{}/{prefix}",
-                self.staging_cfg.endpoint, self.staging_cfg.bucket
-            )
-        }
     }
 }
 
@@ -416,6 +409,73 @@ fn parse_staging_url(
     Ok(staging)
 }
 
+impl Client {
+    /// The store of the current staging snapshot (cheap: the operator is
+    /// reference-counted).
+    fn store(&self) -> StagingStore {
+        self.staging.current().store.clone()
+    }
+
+    /// The live staging handle, shared with every writer this client opened.
+    /// The e2e suite installs a revoked key through it to drive the rotation
+    /// paths, which no test can otherwise reach: a second valid key pair for
+    /// the same bucket is not something a test can mint.
+    #[doc(hidden)]
+    pub fn staging_handle(&self) -> Arc<StagingHandle> {
+        self.staging.clone()
+    }
+
+    /// Run one credential refresh now, instead of waiting for the periodic
+    /// task. Used by the e2e suite to assert what a refresh does when the
+    /// master's location no longer matches this process's.
+    #[doc(hidden)]
+    pub async fn refresh_staging(&self) -> Result<bool> {
+        refresh_managed_staging(&self.staging, "explicit").await
+    }
+}
+
+/// Re-read the staging credentials from the Relyt master and install them if
+/// they changed. A no-op (`Ok(false)`) for a customer-owned bucket. Called by
+/// the periodic refresh task and by a writer whose upload was denied.
+pub(crate) async fn refresh_managed_staging(handle: &StagingHandle, reason: &str) -> Result<bool> {
+    let Some(dsn) = handle.managed_dsn() else {
+        return Ok(false);
+    };
+    let (control, conn) = connect_control(dsn).await?;
+    tokio::spawn(conn);
+    let fresh = fetch_managed_staging(&control).await?;
+    let changed = handle.apply(fresh)?;
+    if changed {
+        tracing::info!(
+            reason,
+            "staging credentials refreshed from the Relyt master"
+        );
+    }
+    Ok(changed)
+}
+
+/// Process-level task: re-read managed staging credentials every
+/// `staging_refresh_interval`, so a rotation on the Relyt side reaches every
+/// writer without a restart. Holds a Weak so it ends with the last handle.
+fn spawn_staging_refresh(handle: &Arc<StagingHandle>, every: Duration) {
+    let weak = Arc::downgrade(handle);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // immediate first tick: skip
+        loop {
+            interval.tick().await;
+            let Some(handle) = weak.upgrade() else {
+                return;
+            };
+            if let Err(e) = refresh_managed_staging(&handle, "periodic").await {
+                tracing::warn!(error = %e,
+                    "staging credential refresh failed; keeping the current credentials");
+            }
+        }
+    });
+}
+
 /// Log-friendly name of the staging variant (the config itself is logged
 /// field by field right after, credentials masked).
 fn staging_kind(s: &Staging) -> &'static str {
@@ -439,6 +499,12 @@ async fn resolve_staging(
     if let Staging::Customer(s) = &cfg.staging {
         return Ok(s.clone());
     }
+    fetch_managed_staging(control).await
+}
+
+/// Ask the Relyt master for the staging location and credentials
+/// (`relyt_get_ingest_staging_config()`), parsed and structurally checked.
+async fn fetch_managed_staging(control: &tokio_postgres::Client) -> Result<StagingConfig> {
     let row = control
         .query_one(
             "SELECT url, access_key_id, secret_access_key \

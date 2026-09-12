@@ -8,7 +8,6 @@
 //! requests lost with a crashed process).
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio_postgres::error::SqlState;
 
 use crate::error::{Error, Result};
+use crate::staging::StagingHandle;
 
 /// Wire values the submission UDF expects.
 ///
@@ -29,7 +29,7 @@ pub const SOURCE_TYPE_S3: i32 = 1;
 pub const TARGET_TYPE_HEAP: i32 = 3;
 
 /// One staged file to announce to the server.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NotifyRequest {
     /// The writer's serial_group (`<db_oid>:<rel_oid>:<writer_id>`). Always
     /// present: insert-only streams submit under serial groups too (M=1),
@@ -50,32 +50,18 @@ pub struct NotifyRequest {
     /// RENAME (or a DROP of an unrelated same-named table) can no longer
     /// wedge the queue on a permanently-failing regclass cast.
     pub target: u32,
-    /// Load options blob (see [`build_copy_options`]).
-    pub options: String,
+    /// CSV delimiter the staged object was written with. The load options
+    /// are assembled at submit time from this and the staging credentials
+    /// current at that moment, so a request that waits in the queue across a
+    /// credential rotation goes out with the key that is valid then.
+    pub delimiter: char,
+    /// Whether the load runs as an upsert (`mode=upsert`) or a plain insert.
+    pub upsert: bool,
     /// serial_seq of the staged file (`StagedFile::serial_seq`): the value
     /// the server serializes and watermarks the group on, and the value the
     /// notify loop reports back as confirmed.
     pub serial_seq: i64,
     pub retry_max: Option<i32>,
-}
-
-/// Hand-written: `options` embeds the staging AK/SK. The blob is printed in
-/// full -- format/header/delimiter/mode are exactly what a load-failure
-/// investigation needs to see -- with only the two credential VALUES masked
-/// (see [`mask_options`]).
-impl fmt::Debug for NotifyRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NotifyRequest")
-            .field("serial_group", &self.serial_group)
-            .field("identifier", &self.identifier)
-            .field("end_offset", &self.end_offset)
-            .field("source_url", &self.source_url)
-            .field("target", &self.target)
-            .field("options", &mask_options(&self.options))
-            .field("serial_seq", &self.serial_seq)
-            .field("retry_max", &self.retry_max)
-            .finish()
-    }
 }
 
 /// Mask one secret for display: the middle is always hidden behind a fixed
@@ -236,17 +222,21 @@ pub struct Notifier {
     /// Shared report board between the loop tasks (writers of it) and
     /// `TableWriter` (reader, via `confirmed()`/`fatal()`).
     state: Arc<Mutex<NotifyState>>,
+    /// The staging location, read at submit time for the credentials that go
+    /// into the job options.
+    staging: Arc<StagingHandle>,
 }
 
 impl Notifier {
     /// Create the notifier; per-writer loop tasks are spawned lazily on the
     /// first request for each writer. Each task owns its own connection and
     /// reconnects on failure, so writers also do not share a retry fate.
-    pub fn spawn(dsn: String) -> Self {
+    pub fn spawn(dsn: String, staging: Arc<StagingHandle>) -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
             dsn,
             state: Arc::new(Mutex::new(NotifyState::default())),
+            staging,
         }
     }
 
@@ -256,7 +246,12 @@ impl Notifier {
         let mut queues = self.queues.lock().unwrap();
         let tx = queues.entry(req.serial_group.clone()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(notify_loop(self.dsn.clone(), rx, self.state.clone()));
+            tokio::spawn(notify_loop(
+                self.dsn.clone(),
+                rx,
+                self.state.clone(),
+                self.staging.clone(),
+            ));
             tx
         });
         tx.send(req).map_err(|_| Error::WriterClosed)
@@ -290,6 +285,7 @@ async fn notify_loop(
     dsn: String,
     mut rx: mpsc::UnboundedReceiver<NotifyRequest>,
     state: Arc<Mutex<NotifyState>>,
+    staging: Arc<StagingHandle>,
 ) {
     let mut client: Option<tokio_postgres::Client> = None;
     while let Some(req) = rx.recv().await {
@@ -311,7 +307,7 @@ async fn notify_loop(
                 }
             }
             let submit_started = std::time::Instant::now();
-            match submit(client.as_ref().unwrap(), &req).await {
+            match submit(client.as_ref().unwrap(), &req, &staging).await {
                 Ok(outcome @ (SubmitOutcome::Accepted | SubmitOutcome::Idempotent)) => {
                     tracing::info!(
                         identifier = %req.identifier,
@@ -373,7 +369,19 @@ enum SubmitOutcome {
 async fn submit(
     client: &tokio_postgres::Client,
     req: &NotifyRequest,
+    staging: &StagingHandle,
 ) -> std::result::Result<SubmitOutcome, tokio_postgres::Error> {
+    // Credentials are read here, not at enqueue: a request that sat in the
+    // queue across a rotation must carry the key that is valid now.
+    let options = {
+        let live = staging.current();
+        build_copy_options(
+            &live.cfg.access_key_id,
+            &live.cfg.secret_access_key,
+            req.delimiter,
+            req.upsert,
+        )
+    };
     let res = client
         .query_one(
             ADD_JOB_SQL,
@@ -389,7 +397,7 @@ async fn submit(
                 // The Relyt master schedules only jobs with priority > 0; <= 0
                 // is never picked up. 1 is the conventional value.
                 &1i32, // priority
-                &req.options,
+                &options,
                 &Option::<String>::None, // msg
                 &Option::<String>::None, // source_detail
                 &req.serial_group,

@@ -350,18 +350,17 @@ pub struct ClientConfig {
 
     pub csv: CsvConfig,
 
+    /// Under Relyt-managed staging, how often the client re-reads the staging
+    /// credentials from the master, so a key rotation on the Relyt side is
+    /// picked up without a restart; a denied upload also triggers an
+    /// immediate refresh. Ignored for a customer-owned bucket. Default 5min.
+    pub staging_refresh_interval: Duration,
+
     /// Consumption-lag sampling period for [`crate::TableWriter::lag`]
     /// (crate::table::TableWriter::lag); internal default 30s. Hidden: not a
     /// customer knob, only the e2e suite shrinks it.
     #[doc(hidden)]
     pub lag_sample_interval: Duration,
-
-    /// How often the lag sampler re-LISTs the staging directory -- the
-    /// expensive half of a sample (GC keeps that directory at tens of
-    /// thousands of objects on purpose); the watermark query still runs
-    /// every `lag_sample_interval`. Internal default 5min. Hidden.
-    #[doc(hidden)]
-    pub lag_list_interval: Duration,
 
     /// How often an idle writer rewrites `_meta/.../state.json` as a liveness
     /// beacon even when `resume_offset` did not move. Internal default 4h.
@@ -398,8 +397,8 @@ impl fmt::Debug for ClientConfig {
             .field("lock_lease_timeout", &self.lock_lease_timeout)
             .field("retry_max", &self.retry_max)
             .field("csv", &self.csv)
+            .field("staging_refresh_interval", &self.staging_refresh_interval)
             .field("lag_sample_interval", &self.lag_sample_interval)
-            .field("lag_list_interval", &self.lag_list_interval)
             .field("state_heartbeat_interval", &self.state_heartbeat_interval)
             .field("bypass_range_checks", &self.bypass_range_checks)
             .finish()
@@ -471,6 +470,7 @@ impl ClientConfig {
     pub const DEFAULT_GC_RETAIN_MIN_FILES: usize = 50_000;
     pub const DEFAULT_LOCK_HEARTBEAT: Duration = Duration::from_secs(30);
     pub const DEFAULT_LOCK_LEASE_TIMEOUT: Duration = Duration::from_secs(180);
+    pub const DEFAULT_STAGING_REFRESH: Duration = Duration::from_secs(5 * 60);
 
     /// Reject configurations that would corrupt the job options list or the
     /// CSV downstream. The options blob is a flat `k=v,k=v` string with no
@@ -551,6 +551,15 @@ impl ClientConfig {
             Duration::from_secs(1),
             Duration::from_secs(600),
         )?;
+        // Below 30s the refresh becomes a noticeable load on the master for
+        // no operational gain; above a day a rotation's overlap window would
+        // have to be absurdly long to be safe.
+        range_dur(
+            "staging_refresh_interval",
+            self.staging_refresh_interval,
+            Duration::from_secs(30),
+            Duration::from_secs(24 * 3600),
+        )?;
         // A lease must comfortably outlive missed heartbeats or every stall
         // becomes a takeover; 24h caps how long a crashed writer can block.
         let lease_floor = self.lock_heartbeat_interval * 3;
@@ -604,8 +613,8 @@ impl ClientConfig {
             lock_lease_timeout: Self::DEFAULT_LOCK_LEASE_TIMEOUT,
             retry_max: Some(Self::DEFAULT_RETRY_MAX),
             csv: CsvConfig::default(),
+            staging_refresh_interval: Self::DEFAULT_STAGING_REFRESH,
             lag_sample_interval: Duration::from_secs(30),
-            lag_list_interval: Duration::from_secs(5 * 60),
             state_heartbeat_interval: Duration::from_secs(4 * 3600),
             bypass_range_checks: false,
         }
