@@ -76,9 +76,11 @@ pub struct StagingConfig {
     pub secret_access_key: String,
     /// "oss" or "s3" — selects the OpenDAL service.
     pub service: StagingService,
-    /// AWS region for SigV4 (S3 only; OSS ignores it). `None` derives it from
-    /// the endpoint (`s3.<region>.amazonaws.com`); S3-compatible services with
-    /// opaque endpoints (MinIO, R2) must set it explicitly (R2 wants "auto").
+    /// Region for SigV4 (S3 and S3-compatible stores; OSS ignores it). `None`
+    /// derives it from the endpoint for every store the client knows by host
+    /// -- AWS, Tencent COS, Kingsoft KS3, UCloud US3, Volcengine TOS, see
+    /// `classify_endpoint` -- while S3-compatible services with opaque endpoints
+    /// (MinIO, R2) must set it explicitly (R2 wants "auto").
     pub region: Option<String>,
 }
 
@@ -125,7 +127,7 @@ impl StagingConfig {
     pub fn resolve_region(&self) -> Option<String> {
         self.region
             .clone()
-            .or_else(|| derive_aws_region(&self.endpoint))
+            .or_else(|| derive_region(&self.endpoint))
     }
 }
 
@@ -214,41 +216,91 @@ pub(crate) fn validate_staging(s: &StagingConfig) -> Result<()> {
     Ok(())
 }
 
-/// Extract the region from an AWS endpoint. The client MUST sign with the
-/// real AWS region name (a bare `s3.amazonaws.com` means `us-east-1`); how
-/// the Relyt master derives a region from the job's URL for its own reads is
-/// its business and never what SigV4 wants on the wire.
+/// Object-store endpoints the client recognises by host: the store kind, and
+/// where the region sits in the name. This is the same set the Relyt master
+/// reads staging locations with, kept in step on purpose -- a host the master
+/// can read but the client cannot sign for is exactly the gap this table
+/// closes -- so a change on either side must be mirrored on the other.
 ///
-/// Recognized shapes, with or without a `.cn` suffix:
-///   s3.amazonaws.com                 -> us-east-1
-///   s3.<region>.amazonaws.com        -> <region>
-///   s3-<region>.amazonaws.com        -> <region>   (legacy dashed form)
-/// Anything else (MinIO, R2, ...) -> None: the caller must configure it.
-pub(crate) fn derive_aws_region(endpoint: &str) -> Option<String> {
+/// Row = (host prefix, host suffixes, store). The region is the text between
+/// prefix and suffix without its leading `.` or `-`:
+/// `cos.ap-shanghai.myqcloud.com` -> `ap-shanghai`,
+/// `s3-us-west-2.amazonaws.com` -> `us-west-2`; OSS needs none. Two departures
+/// from the master's table: a bare `s3.amazonaws.com` is `us-east-1` (SigV4
+/// signs with the real region; the master's internal alias for it is its own
+/// business), and Google Cloud Storage is left out until signing against its
+/// interoperability endpoint has been verified.
+///
+/// Coverage: AWS S3 and Alibaba OSS are exercised end to end. The other stores
+/// are recognised by host and signed as S3-compatible, but no end-to-end test
+/// runs against them yet.
+const KNOWN_ENDPOINTS: &[(&str, &[&str], StagingService)] = &[
+    (
+        "s3",
+        &[".amazonaws.com", ".amazonaws.com.cn"],
+        StagingService::S3,
+    ),
+    (
+        "internal.s3",
+        &[".amazonaws.com", ".amazonaws.com.cn"],
+        StagingService::S3,
+    ),
+    ("oss", &[".aliyuncs.com"], StagingService::Oss),
+    ("cos", &[".myqcloud.com"], StagingService::S3),
+    ("ks3", &[".ksyuncs.com"], StagingService::S3),
+    ("s3", &[".ufileos.com"], StagingService::S3),
+    (
+        "tos-s3",
+        &[".volces.com", ".ivolces.com"],
+        StagingService::S3,
+    ),
+];
+
+/// Classify an endpoint by host: the store kind and, for S3 and S3-compatible
+/// stores, the region SigV4 signs with. `None` for a host outside
+/// [`KNOWN_ENDPOINTS`] (MinIO, a custom domain): the caller decides whether
+/// that is an error (Relyt-managed staging has nothing to fall back on) or
+/// something the customer supplies through `StagingConfig::region`.
+pub(crate) fn classify_endpoint(endpoint: &str) -> Option<(StagingService, Option<String>)> {
     let host = endpoint
         .strip_prefix("https://")
         .or_else(|| endpoint.strip_prefix("http://"))
         .unwrap_or(endpoint);
-    // A `:port` suffix is not part of the region-bearing name; the OSS
-    // detection in parse_staging_url strips it too, so the two agree.
+    // A `:port` suffix is not part of the name.
     let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
-    let rest = host
-        .strip_suffix(".amazonaws.com.cn")
-        .or_else(|| host.strip_suffix(".amazonaws.com"))?;
-    if rest == "s3" {
-        return Some("us-east-1".to_string());
+    for (prefix, suffixes, service) in KNOWN_ENDPOINTS {
+        let Some(after_prefix) = host.strip_prefix(prefix) else {
+            continue;
+        };
+        for suffix in suffixes.iter() {
+            let Some(middle) = after_prefix.strip_suffix(suffix) else {
+                continue;
+            };
+            if *service == StagingService::Oss {
+                return Some((StagingService::Oss, None));
+            }
+            let region = match middle {
+                "" => "us-east-1".to_string(),
+                m if m.starts_with('.') || m.starts_with('-') => m[1..].to_string(),
+                // `s3x.amazonaws.com`: shares the prefix, is not this shape.
+                _ => return None,
+            };
+            if region.is_empty()
+                || !region
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return None;
+            }
+            return Some((*service, Some(region)));
+        }
     }
-    let region = rest
-        .strip_prefix("s3.")
-        .or_else(|| rest.strip_prefix("s3-"))?;
-    if region.is_empty()
-        || !region
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return None;
-    }
-    Some(region.to_string())
+    None
+}
+
+/// The region [`classify_endpoint`] derives for `endpoint`, if any.
+pub(crate) fn derive_region(endpoint: &str) -> Option<String> {
+    classify_endpoint(endpoint).and_then(|(_, region)| region)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -812,38 +864,38 @@ mod tests {
     }
 
     #[test]
-    fn aws_region_derivation() {
-        assert_eq!(
-            derive_aws_region("s3.ap-east-1.amazonaws.com").as_deref(),
-            Some("ap-east-1")
-        );
-        // A port does not hide the region.
-        assert_eq!(
-            derive_aws_region("s3.ap-east-1.amazonaws.com:443").as_deref(),
-            Some("ap-east-1")
-        );
-        assert_eq!(
-            derive_aws_region("s3-us-west-2.amazonaws.com").as_deref(),
-            Some("us-west-2")
-        );
+    fn endpoint_classification_matches_what_the_master_reads() {
+        use StagingService::{Oss, S3};
+        let c = classify_endpoint;
+        let s3 = |r: &str| Some((S3, Some(r.to_string())));
+        // AWS, in every spelling; a port or a scheme hides nothing.
+        assert_eq!(c("s3.ap-east-1.amazonaws.com"), s3("ap-east-1"));
+        assert_eq!(c("s3.ap-east-1.amazonaws.com:443"), s3("ap-east-1"));
+        assert_eq!(c("https://s3.ap-east-1.amazonaws.com"), s3("ap-east-1"));
+        assert_eq!(c("s3-us-west-2.amazonaws.com"), s3("us-west-2"));
+        assert_eq!(c("s3.cn-north-1.amazonaws.com.cn"), s3("cn-north-1"));
         // Bare endpoint signs as us-east-1 (whatever alias the Relyt master
         // uses internally is never what SigV4 wants on the wire).
+        assert_eq!(c("s3.amazonaws.com"), s3("us-east-1"));
+        // OSS: native signing, no region; internal endpoints included.
+        assert_eq!(c("oss-cn-hangzhou.aliyuncs.com"), Some((Oss, None)));
         assert_eq!(
-            derive_aws_region("s3.amazonaws.com").as_deref(),
-            Some("us-east-1")
+            c("oss-cn-hangzhou-internal.aliyuncs.com"),
+            Some((Oss, None))
         );
+        // The S3-compatible stores the master also reads.
+        assert_eq!(c("cos.ap-shanghai.myqcloud.com"), s3("ap-shanghai"));
+        assert_eq!(c("ks3-cn-beijing.ksyuncs.com"), s3("cn-beijing"));
+        assert_eq!(c("s3-cn-bj.ufileos.com"), s3("cn-bj"));
+        assert_eq!(c("tos-s3-cn-beijing.volces.com"), s3("cn-beijing"));
+        // Outside the table: the caller has to be told the region.
+        assert_eq!(c("minio.internal:9000"), None);
+        assert_eq!(c("mybucket.s3.fake.example.com"), None);
+        assert_eq!(c("s3x.amazonaws.com"), None);
         assert_eq!(
-            derive_aws_region("s3.cn-north-1.amazonaws.com.cn").as_deref(),
-            Some("cn-north-1")
+            derive_region("cos.ap-shanghai.myqcloud.com").as_deref(),
+            Some("ap-shanghai")
         );
-        // Scheme prefixes are tolerated.
-        assert_eq!(
-            derive_aws_region("https://s3.ap-east-1.amazonaws.com").as_deref(),
-            Some("ap-east-1")
-        );
-        // Non-AWS endpoints cannot be derived.
-        assert_eq!(derive_aws_region("oss-cn-hangzhou.aliyuncs.com"), None);
-        assert_eq!(derive_aws_region("minio.internal:9000"), None);
-        assert_eq!(derive_aws_region("mybucket.s3.fake.example.com"), None);
+        assert_eq!(derive_region("oss-cn-hangzhou.aliyuncs.com"), None);
     }
 }

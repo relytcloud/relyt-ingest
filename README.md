@@ -22,6 +22,11 @@ Compatibility: arrow **58.x only** (the SDK is built against the `deltalake`
 0.32 line; another arrow major does not compile against `append`), and Rust
 **1.85** or newer (MSRV).
 
+Staging stores: Alibaba OSS and AWS S3 are covered end to end. Tencent COS,
+Kingsoft KS3, UCloud US3 and Volcengine TOS are recognised by endpoint and
+signed as S3-compatible, but the integration suite does not run against them
+yet.
+
 ## Usage sketch
 
 ```rust

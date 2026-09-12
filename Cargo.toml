@@ -54,3 +54,11 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+
+[lints.clippy]
+# `Error` is a wide enum: it carries the object-store and database error types,
+# so every `Result` in the crate trips this lint. Boxing the error would change
+# the public `Error` shape -- callers match on its variants -- so it is
+# deferred; errors are not on the hot path and the size costs nothing
+# measurable there. Everything else in clippy's default set is a CI gate.
+result_large_err = "allow"

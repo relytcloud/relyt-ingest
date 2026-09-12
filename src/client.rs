@@ -5,8 +5,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{
-    cluster_id_is_unset, connect_control, validate_staging, ClientConfig, Staging, StagingConfig,
-    StagingService, StreamMode,
+    classify_endpoint, cluster_id_is_unset, connect_control, validate_staging, ClientConfig,
+    Staging, StagingConfig, StreamMode,
 };
 use crate::error::{Error, Result};
 use crate::lock::{new_instance_uuid, LockFile};
@@ -248,12 +248,12 @@ impl Client {
         let mut anchor = plan.max_staged;
         if let Some(w) = watermark {
             let (wm_epoch, wm_seq) = decode_serial_seq(w);
-            if anchor.map_or(true, |(e, s)| (wm_epoch, wm_seq) > (e, s)) {
+            if anchor.is_none_or(|(e, s)| (wm_epoch, wm_seq) > (e, s)) {
                 anchor = Some((wm_epoch, wm_seq));
             }
         }
         if let Some(st) = &state {
-            if anchor.map_or(true, |(e, _)| st.max_epoch_used > e) {
+            if anchor.is_none_or(|(e, _)| st.max_epoch_used > e) {
                 anchor = Some((st.max_epoch_used, 0));
             }
         }
@@ -341,11 +341,11 @@ impl Client {
 /// Split `s3://<endpoint>/<bucket>[/<prefix>]` and fill in what the URL does
 /// not carry.
 ///
-/// The scheme is `s3` for both object stores -- it says "S3-style URL", not
-/// which store -- so the store comes from the host: an Alibaba OSS endpoint
-/// is `*.aliyuncs.com`, and everything else is S3 or S3-compatible. The
-/// region follows the same host (`derive_aws_region`), which is why the
-/// server needs to provision only this one string.
+/// The scheme is `s3` for every object store -- it says "S3-style URL", not
+/// which store -- so the store kind and the region both come from the host,
+/// through the same table of endpoints the Relyt master reads these locations
+/// with (`classify_endpoint`). That is why the server needs to provision only
+/// this one string.
 fn parse_staging_url(
     url: &str,
     access_key_id: String,
@@ -372,41 +372,30 @@ fn parse_staging_url(
             "staging url from the server has an empty endpoint or bucket: `{url}`"
         )));
     }
-    let service = if endpoint
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(endpoint)
-        .ends_with(".aliyuncs.com")
-    {
-        StagingService::Oss
-    } else {
-        StagingService::S3
+    // Store kind and region both come from the host. A host outside the
+    // table cannot be signed for, and under Relyt-managed staging the customer
+    // has no field to fix that with -- so say who can, rather than pointing at
+    // StagingConfig.region as the customer-owned check does.
+    let Some((service, region)) = classify_endpoint(endpoint) else {
+        return Err(Error::Config(format!(
+            "the staging url the Relyt master handed out (`{url}`) names an endpoint the \
+             client cannot sign for. Relyt-managed staging accepts the endpoints the Relyt \
+             master itself reads: Alibaba OSS (*.aliyuncs.com), AWS S3 (*.amazonaws.com, \
+             *.amazonaws.com.cn), Tencent COS (*.myqcloud.com), Kingsoft KS3 (*.ksyuncs.com), \
+             UCloud US3 (*.ufileos.com) and Volcengine TOS (*.volces.com, *.ivolces.com). Ask \
+             the Relyt administrator to provision one of those, or use your own bucket \
+             through Staging::Customer(..) with an explicit region"
+        )));
     };
-    let staging = StagingConfig {
+    Ok(StagingConfig {
         endpoint: endpoint.to_string(),
         bucket: bucket.to_string(),
         prefix: prefix.trim_matches('/').to_string(),
         access_key_id,
         secret_access_key,
         service,
-        // The server hands out a location, never a region: a Relyt-managed
-        // bucket is expected on OSS (needs none) or on AWS (the endpoint
-        // carries it), and derive_aws_region recovers the latter.
-        region: None,
-    };
-    // Anything else cannot be signed, and under Relyt-managed staging the
-    // customer has no field to fix that with -- so say who can, rather than
-    // pointing at StagingConfig.region as the customer-owned check does.
-    if staging.service == StagingService::S3 && staging.resolve_region().is_none() {
-        return Err(Error::Config(format!(
-            "the staging url the Relyt master handed out (`{url}`) is on an S3-compatible \
-             store whose region cannot be derived from its host; Relyt-managed staging \
-             supports `*.aliyuncs.com` and `*.amazonaws.com(.cn)` endpoints. Ask the Relyt \
-             administrator to provision one of those, or use your own bucket through \
-             Staging::Customer(..) with an explicit region"
-        )));
-    }
-    Ok(staging)
+        region,
+    })
 }
 
 impl Client {
@@ -678,6 +667,7 @@ async fn acquire_writer_lease(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StagingService;
 
     #[test]
     fn staging_url_splits_and_derives_the_store() {
@@ -748,6 +738,18 @@ mod tests {
             .to_string();
         assert!(err.contains("Relyt administrator"), "got: {err}");
         assert!(!err.contains("StagingConfig.region"), "got: {err}");
+    }
+
+    #[test]
+    fn staging_url_on_a_store_the_master_reads_but_aws_does_not_own() {
+        let c = parse_staging_url(
+            "s3://cos.ap-shanghai.myqcloud.com/b/p",
+            "ak".into(),
+            "sk".into(),
+        )
+        .unwrap();
+        assert_eq!(c.service, StagingService::S3);
+        assert_eq!(c.region.as_deref(), Some("ap-shanghai"));
     }
 
     #[test]

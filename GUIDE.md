@@ -49,7 +49,7 @@ crate 发布在 crates.io，API 文档在 docs.rs。arrow 与 Rust 版本约束�
 | 信息 | 提供方 | SDK 中的位置 |
 |---|---|---|
 | Relyt 控制连接：host / port / dbname + **摄入账号**用户名密码（最小权限账号，无需 superuser） | Relyt 管理员 | `ClientConfig::new(control_dsn)` 的唯一参数，tokio-postgres 连接串格式 `host=... port=... user=... password=... dbname=...` |
-| staging 桶 | **默认由 Relyt 提供**，SDK 在 connect 时自动索取，你无需填写任何内容；仅自备桶模式下由你提供 endpoint、bucket、prefix、AK/SK（非 AWS 形态 endpoint 如 MinIO/R2 还需 region） | 默认模式：无；自备桶模式：`ClientConfig::with_customer_staging(StagingConfig { .. }, dsn)` |
+| staging 桶 | **默认由 Relyt 提供**，SDK 在 connect 时自动索取，你无需填写任何内容；仅自备桶模式下由你提供 endpoint、bucket、prefix、AK/SK（endpoint 为 AWS、腾讯 COS、金山 KS3、UCloud、火山 TOS 的标准域名时 region 自动识别，MinIO/R2 等需显式填；**目前 e2e 只覆盖阿里云 OSS 与 AWS S3，其余厂商仅按域名识别并以 S3 兼容方式签名，尚无用例覆盖**） | 默认模式：无；自备桶模式：`ClientConfig::with_customer_staging(StagingConfig { .. }, dsn)` |
 | 桶生命周期规则 | 桶所有方在云控制台配置：挂 `<prefix>/staging/`，**不挂** `_meta/` | 无（SDK 不感知） |
 | Relyt 实例标识（instance id） | 一般**不需要**——SDK 自动向服务端获取；仅实例未配置时由 Relyt 管理员提供 | `ClientConfig::cluster_id`（`Option<String>`） |
 | 目标表 | 客户自行建表（heap 表；upsert 需 PRIMARY KEY；列类型见「支持的列类型」） | `open_table("schema.table", writer_id)` |
@@ -274,7 +274,7 @@ with time zone`、`integer`、`bigint`、`double`、`date`、`boolean`、`smalli
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `staging` | `Staging::Relyt` | 桶来源。默认由服务端提供桶与凭证；`Staging::Customer(StagingConfig { endpoint/bucket/prefix/AK/SK/service/region })` 表示自备桶，`region` 仅 MinIO/R2 等非 AWS 端点需要显式填。见「staging 桶归属」 |
+| `staging` | `Staging::Relyt` | 桶来源。默认由服务端提供桶与凭证；`Staging::Customer(StagingConfig { endpoint/bucket/prefix/AK/SK/service/region })` 表示自备桶，`region` 仅 MinIO/R2 等无法从域名识别的端点需要显式填（AWS/腾讯 COS/金山 KS3/UCloud/火山 TOS 自动识别；e2e 只覆盖 OSS 与 AWS S3）。见「staging 桶归属」 |
 | `control_dsn` | 必填 | Relyt 控制连接串（仅元数据与通知，不走行数据） |
 | `stream_mode` | `Upsert` | 有主键表用 `Upsert`（同 key 终值=最后一次写入）；无主键表用 `InsertOnly`（重复行原样保留）。**同一张表的所有 writer 必须同模式**；切换模式前需停写排空 |
 | `staging_compression` | `Gzip` | staged CSV 文件 gzip 压缩后上传（对象名 `.csv.gz`），上传带宽与 staging 存储约降 5~10 倍；Relyt 服务端按文件内容自动识别并解压，**无需任何服务端配置**。设为 `Plain` 得到可直接下载阅读的明文 `.csv`（排障时有用）。攒批阈值始终按压缩前的 CSV 大小判定 |

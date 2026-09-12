@@ -663,6 +663,7 @@ impl WriterInner {
     ///   2. it is older than `gc_retain_days` (age = now - its epoch, the
     ///      write-time wall clock embedded in the name);
     ///   3. deleting it keeps the directory at >= `gc_retain_min_files`.
+    ///
     /// Hard rules: the newest object is never deleted (it feeds the resume
     /// computation even when fully consumed); unknown objects are warned
     /// about, never deleted (evidence); a failed watermark query skips the

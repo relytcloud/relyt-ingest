@@ -64,7 +64,7 @@ pub fn plan_recovery(mut staged: Vec<StagedFile>, watermark: Option<i64>) -> Res
     let mut backfill = Vec::new();
     for f in staged {
         let seq = f.serial_seq()?;
-        if watermark.map_or(true, |w| seq > w) {
+        if watermark.is_none_or(|w| seq > w) {
             backfill.push(f);
         }
     }
