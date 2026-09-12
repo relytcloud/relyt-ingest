@@ -1,8 +1,9 @@
 # Continuous integration for relyt-ingest.
 #
 # Three jobs, each answering one question:
-#   test    -- does the crate build, pass its unit and doc tests, and document
-#              cleanly on the toolchain we develop with (rust-toolchain.toml)?
+#   test    -- does the crate build, lint clean under clippy's default set,
+#              pass its unit and doc tests, and document cleanly on the
+#              toolchain we develop with (rust-toolchain.toml)?
 #   msrv    -- does it still build on the floor Cargo.toml promises consumers
 #              (rust-version = 1.85)? cargo hard-errors below that floor, so
 #              every notch we declare is a notch a consumer is forced to have.
@@ -37,6 +38,8 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      - name: clippy, default lint set as errors (result_large_err is allowed in Cargo.toml)
+        run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --lib --examples
       - run: cargo test --locked --lib
       - run: cargo test --locked --doc
