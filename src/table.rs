@@ -525,8 +525,10 @@ impl WriterInner {
         let bytes = body.len();
 
         // 3. Optional gzip, then a deterministic-name put (a retry overwrites
-        //    the same object). gzip level 6 is the bandwidth/CPU sweet spot
-        //    for CSV; the server sniffs the magic bytes, no option needed.
+        //    the same object). Level 6 (the default) is the bandwidth/CPU
+        //    sweet spot for CSV; the backend is zlib-rs (see Cargo.toml),
+        //    which is where most of a rotation's CPU goes. The server sniffs
+        //    the magic bytes, no option needed.
         let payload = if self.cfg.staging_compression == StagingCompression::Gzip {
             use std::io::Write;
             let mut enc = flate2::write::GzEncoder::new(

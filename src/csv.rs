@@ -193,8 +193,11 @@ impl<'a> Col<'a> {
             }
             // Rust's Display for f32/f64 never switches to scientific notation
             // (1e21f64 renders as "1000000000000000000000"), so "decimal plain"
-            // holds. TODO: NaN/±inf render as "NaN"/"inf" here while the Relyt
-            // master expects "NaN"/"Infinity".
+            // holds. Non-finite values render as "NaN" / "inf" / "-inf", and
+            // the server-side load accepts that spelling as-is: the kernel's
+            // float4in/float8in take "inf" case-insensitively, and
+            // all_supported_types_round_trip proves it end to end with two
+            // non-finite rows that read back as NaN / Infinity / -Infinity.
             Col::F32(a) => {
                 null_is_empty!(a);
                 write_quoted(out, a.value(row));

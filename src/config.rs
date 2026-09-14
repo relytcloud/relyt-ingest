@@ -315,8 +315,10 @@ pub enum StagingService {
 /// job's load options.
 /// How staged CSV objects are stored. The Relyt master sniffs gzip magic bytes
 /// and decompresses as it reads the file, so this is a pure
-/// client-side choice: gzip trades a little producer CPU for ~5-10x less
-/// upload bandwidth and staging storage (CSV compresses very well).
+/// client-side choice: gzip trades producer CPU for ~2.5x less upload
+/// bandwidth and staging storage on wide CSV rows (more on repetitive data).
+/// Compression is the dominant CPU cost of a rotation, which is why the
+/// crate links flate2's zlib-rs backend rather than the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StagingCompression {
     /// gzip (default). Objects are named `*.csv.gz`.

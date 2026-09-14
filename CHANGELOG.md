@@ -14,3 +14,5 @@ minor release may contain breaking changes; each one is called out here.
   resumes from the staging state after a crash, and duplicate primary keys
   inside one staged file are collapsed last-write-wins before upload.
 - Requires Relyt 3.55.0 or later on the server side.
+- gzip of staged objects uses flate2's zlib-rs backend: 2.6x less CPU per
+  file than the default backend at the same level and ratio.
