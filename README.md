@@ -51,7 +51,7 @@ table.flush().await?;                                  // durable staging point
 | Module | Contents |
 |---|---|
 | `client` | `Client::connect` / `open_table` (recovery handshake) |
-| `table` | `TableWriter`: buffered append, double-threshold rotation, flush |
+| `table` | `TableWriter`: buffered append, double-threshold sealing, render → gzip → put pipeline, flush |
 | `csv` | POSTGRESQL_CSV formatter (quote-all-non-null, NULL bare, NUL strip, decimal plain, header) |
 | `dedup` | intra-file PK dedup, last write wins (poison-file prevention) |
 | `naming` | file naming, serial_seq encoding (`epoch<<20\|seq`), identifier/serial_group limits |
@@ -93,14 +93,20 @@ enforce them — they are deployment settings:
    data. The client-side watermark covers this for a writer that keeps running
    with its staging prefix intact, but a wiped prefix falls back to the server.
 
-**Rotation blocks its writer.** A rotation (dedup → CSV → OSS put → notify) runs
-under the writer lock, so an `append` that trips the size threshold pays the OSS
-latency and concurrent appends on the same writer queue behind it. This is
-deliberate: splitting the drain from the put would either lose buffered rows on
-a failed put, or let sequences reach the server out of order (and an
-out-of-order file gets swallowed by the submission gate as an already-consumed
-replay). Moving rotation onto a dedicated writer task — same ordering, no
-blocking — is the tracked follow-up.
+**Rotation runs in a per-writer pipeline; `append` only buffers.** When a
+threshold trips, the buffer is sealed under the next seq and handed to three
+background stages (render → gzip → put + notify) joined by bounded channels;
+the CPU stages run on the blocking pool. Files still reach the server in seq
+order (one task per stage, hand-over under a lock), `staged_offset` advances
+only after the put returned, and a failed put retries the same bytes to the
+same key rather than returning rows to the buffer. `append` waits only when
+`rotation_queue_depth` sealed files are already queued (backpressure), and
+once the pipeline is stuck it returns without taking the batch --
+`Error::StagingStalled` while retrying may still clear it,
+`Error::RotationFailed` when it cannot. `flush()` waits for its file to be
+durable and reports the same two the same way. Offsets must
+move forward within a writer (`append` refuses a rewound batch with a
+`Config` error; reopen the table instead).
 
 ## Deployment sizing (multi-writer)
 
@@ -109,13 +115,15 @@ so two resources scale linearly with W = tables x partitions per process:
 
 | Resource | Formula | Why |
 |---|---|---|
-| master connections (resident) | **1 (control) + W** (one notify connection per writer); plus W short-lived GC connections per hour, staggered | each serial_group lazily owns a notify loop with its own connection |
-| memory upper bound | **W x `rotate_size_bytes`** (64MB default) + a transient second copy of the CSV during rotation | each writer buffers independently |
-| background tasks | 4W tokio tasks (ticker / GC / lease heartbeat / notify) | negligible |
+| master connections (resident) | **1 (control) + 2W**: one notify connection and one lag-sampler connection per writer. Short-lived on top: one GC connection per writer per hour, and under managed staging one credential refresh per **process** every 5 minutes | each serial_group lazily owns a notify loop with its own connection; the lag sampler keeps one rather than forking a backend every 30s |
+| memory upper bound | **W x (6 + `rotation_queue_depth`) x `rotate_size_bytes`** ((6 + 3) x 64MB = 576MB per writer by default) | one buffer filling + `rotation_queue_depth` (default 3) sealed files queued + up to ~5 file-equivalents in flight across the render / gzip / put stages and the slots between them; a full queue blocks `append`, so this is a hard bound and actual residency is usually far below it |
+| background tasks | 7W tokio tasks (ticker / GC / lease heartbeat / lag sampler / render / gzip / put) + W notify loops | negligible |
+| tokio blocking threads | up to **2 per writer** (render, gzip; held only while working) against tokio's default cap of 512 | past ~256 busy writers raise the runtime's `max_blocking_threads`; exceeding it queues rather than fails, and shows up as throughput loss. Their stacks are outside the memory formula above |
 
-Example: 10 tables x 32 partitions = 320 writers -> ~321 resident connections
-(budget against the master's `max_connections`) and a ~20GB memory bound
-(lower `rotate_size_bytes` to 8-16MB, or rely on the 15s time threshold).
+Example: 10 tables x 32 partitions = 320 writers -> ~641 resident connections
+(budget against the master's `max_connections`) and a 320 x 576MB ~ 180GB
+memory bound; at `rotate_size_bytes` = 16MB it is ~45GB (or rely on the 15s
+time threshold to keep files small).
 Connection multiplexing for hundreds of writers is a tracked follow-up.
 
 ## Tests
@@ -132,5 +140,4 @@ is not part of the published crate.
 
 - float rendering: `NaN`/`±inf` render as Rust's `NaN`/`inf`; the Relyt master
   expects `NaN`/`Infinity`.
-- Rotation off the append path (dedicated writer task) and schema cache
-  fallback; see the review follow-up issues for the rest.
+- Schema cache fallback; see the review follow-up issues for the rest.

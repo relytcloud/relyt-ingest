@@ -72,6 +72,51 @@ pub enum Error {
     #[error("staging storage error: {0}")]
     Storage(#[from] opendal::Error),
 
+    /// The file at the head of this writer's rotation pipeline has failed to
+    /// stage `attempts` times in a row. Returned once
+    /// `staging_error_after_attempts` is reached by `flush` / `close`
+    /// instead of waiting on, and by an `append` that would otherwise park
+    /// on the full queue -- that batch was NOT taken and can be appended
+    /// again later. Nothing is lost: the pipeline keeps retrying the same
+    /// bytes with backoff, and a later `flush` waits again. The rows behind
+    /// it are not durable, so do not commit their Kafka offsets.
+    #[error(
+        "staging the current file has failed {attempts} time(s) and is still being retried; \
+         last error: {last}"
+    )]
+    StagingStalled { attempts: u32, last: String },
+
+    /// A rotation stage failed in a way retrying cannot fix: the rows were
+    /// already sealed into a file, and every attempt to render, compress or
+    /// upload it hits the same error. Unlike
+    /// [`StagingStalled`](Self::StagingStalled) this will not clear on its
+    /// own -- waiting is pointless. The rows are not durable, so do not
+    /// commit their Kafka offsets; fix what the message names, then restart
+    /// and let the recovery handshake replay them.
+    ///
+    /// `source` is an `Arc` because the same failure is reported to every
+    /// waiter on the writer, and `Error` itself cannot be cloned (its
+    /// storage and database variants wrap types that are not).
+    #[error("rotation cannot proceed: {stage} of the current file keeps failing with: {source}")]
+    RotationFailed {
+        stage: &'static str,
+        #[source]
+        source: std::sync::Arc<Error>,
+    },
+
+    /// The order tripwire fired: a file reached this writer's upload stage
+    /// with a seq that is not the next one. That is a broken SDK invariant
+    /// (Kafka offsets, being caller input, are checked by `append` instead),
+    /// not an operational fault,
+    /// and the rows in the gap are NOT in staging -- a restart resumes after
+    /// the highest staged offset and skips them. Stop consuming this
+    /// stream, do not commit its Kafka offsets, roll back or upgrade the
+    /// SDK, then rewind the consumer to the offset range in the message.
+    /// Every `append` / `flush` / `close` on the writer fails with this
+    /// from now on.
+    #[error("staging order violation: {0}")]
+    StagingOrderViolation(String),
+
     /// Control-plane (postgres) failure surfaced through a synchronous call
     /// path such as `Client::connect` / `open_table`. The notify thread never
     /// returns this; it retries internally.

@@ -41,7 +41,9 @@ impl TableSchema {
     ///
     /// Deliberately does NOT require a primary key: that is a per-mode rule
     /// (upsert needs one for the ON CONFLICT target, insert-only does not), so
-    /// it is enforced by the caller that knows the stream mode.
+    /// it is enforced by the caller that knows the stream mode. Nor does it
+    /// judge the key's types — see [`Self::validate_pk_for_dedup`], which only
+    /// applies to upsert streams.
     pub fn validate(&self) -> Result<()> {
         for field in self.arrow.fields() {
             if !is_supported_type(field.data_type()) {
@@ -55,6 +57,32 @@ impl TableSchema {
             return Ok(());
         }
         self.pk_indices().map(|_| ())
+    }
+
+    /// Every primary-key column must be one the intra-file dedup pass can
+    /// hash. Upsert streams only: insert-only never deduplicates, so a key
+    /// the encoder cannot handle is no obstacle there and such a table must
+    /// keep working.
+    ///
+    /// Checked at `open_table` because the dedup pass runs inside the
+    /// rotation pipeline, where a failure is permanent and the rows are
+    /// already sealed; here the caller still holds its data.
+    pub fn validate_pk_for_dedup(&self) -> Result<()> {
+        for i in self.pk_indices()? {
+            let field = self.arrow.field(i);
+            if !crate::dedup::is_supported_pk_type(field.data_type()) {
+                return Err(Error::UnsupportedType {
+                    column: field.name().clone(),
+                    data_type: format!(
+                        "{:?} (primary key column of an upsert stream: floating-point keys \
+                         cannot be deduplicated, because equality on NaN and ±0.0 differs \
+                         between the client and the server)",
+                        field.data_type()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 

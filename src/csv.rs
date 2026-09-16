@@ -77,9 +77,10 @@ impl CsvFormatter {
     /// Every column is downcast once per batch and each cell is written
     /// straight into `out` (quoted, NUL-stripped): no per-cell String, no
     /// per-cell schema lookup, no per-cell `DataType` dispatch -- this loop
-    /// runs under the writer's state lock for every rotation.
-    /// Callers reserve `out` up front; see `StageStats::bytes` for the
-    /// calibration this makes possible.
+    /// is the render stage's whole CPU cost for a file (it runs on the
+    /// blocking pool, one file at a time per writer). Callers reserve `out`
+    /// up front from the previous file's measured bytes-per-row (see
+    /// `table::render`).
     pub fn format_rows(&self, batch: &RecordBatch, rows: &[usize], out: &mut String) -> Result<()> {
         let schema = batch.schema();
         let cols = batch

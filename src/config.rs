@@ -410,6 +410,24 @@ pub struct ClientConfig {
     /// immediate refresh. Ignored for a customer-owned bucket. Default 5min.
     pub staging_refresh_interval: Duration,
 
+    /// How many sealed files may wait for the rotation pipeline before the
+    /// `append` that trips a rotation threshold blocks. One slot keeps the
+    /// pipeline busy while the buffer refills; the rest absorb a producer
+    /// burst before `append` blocks. Default 3; each slot costs
+    /// `rotate_size_bytes` of memory. The per-writer memory bound is
+    /// (6 + this) x `rotate_size_bytes` (GUIDE.md "容量估算").
+    pub rotation_queue_depth: usize,
+
+    /// After this many consecutive failed attempts to stage the file at the
+    /// head of the rotation pipeline, `flush()` and `close()` return
+    /// [`Error::StagingStalled`](crate::Error::StagingStalled) instead of
+    /// waiting on, and so does an `append` that would otherwise park on the
+    /// full queue (its batch is not taken). The pipeline itself keeps retrying the same file with
+    /// backoff (1s doubling to 30s) and no row is dropped; a later `flush()`
+    /// waits again. Default 3: reported when the third failure lands, after
+    /// 1s + 2s of backoff plus the attempts' own duration.
+    pub staging_error_after_attempts: u32,
+
     /// Consumption-lag sampling period for [`crate::TableWriter::lag`]
     /// (crate::table::TableWriter::lag); internal default 30s. Hidden: not a
     /// customer knob, only the e2e suite shrinks it.
@@ -452,6 +470,11 @@ impl fmt::Debug for ClientConfig {
             .field("retry_max", &self.retry_max)
             .field("csv", &self.csv)
             .field("staging_refresh_interval", &self.staging_refresh_interval)
+            .field("rotation_queue_depth", &self.rotation_queue_depth)
+            .field(
+                "staging_error_after_attempts",
+                &self.staging_error_after_attempts,
+            )
             .field("lag_sample_interval", &self.lag_sample_interval)
             .field("state_heartbeat_interval", &self.state_heartbeat_interval)
             .field("bypass_range_checks", &self.bypass_range_checks)
@@ -525,6 +548,8 @@ impl ClientConfig {
     pub const DEFAULT_LOCK_HEARTBEAT: Duration = Duration::from_secs(30);
     pub const DEFAULT_LOCK_LEASE_TIMEOUT: Duration = Duration::from_secs(180);
     pub const DEFAULT_STAGING_REFRESH: Duration = Duration::from_secs(5 * 60);
+    pub const DEFAULT_ROTATION_QUEUE_DEPTH: usize = 3;
+    pub const DEFAULT_STAGING_ERROR_AFTER_ATTEMPTS: u32 = 3;
 
     /// Reject configurations that would corrupt the job options list or the
     /// CSV downstream. The options blob is a flat `k=v,k=v` string with no
@@ -614,6 +639,20 @@ impl ClientConfig {
             Duration::from_secs(30),
             Duration::from_secs(24 * 3600),
         )?;
+        // Each queue slot is a whole file of memory; past a handful the
+        // right fix is a smaller rotate_size_bytes, not a deeper queue.
+        if !(1..=16).contains(&self.rotation_queue_depth) {
+            return Err(Error::Config(format!(
+                "rotation_queue_depth = {} is outside the allowed range [1, 16]",
+                self.rotation_queue_depth
+            )));
+        }
+        if !(1..=10_000).contains(&self.staging_error_after_attempts) {
+            return Err(Error::Config(format!(
+                "staging_error_after_attempts = {} is outside the allowed range [1, 10000]",
+                self.staging_error_after_attempts
+            )));
+        }
         // A lease must comfortably outlive missed heartbeats or every stall
         // becomes a takeover; 24h caps how long a crashed writer can block.
         let lease_floor = self.lock_heartbeat_interval * 3;
@@ -668,6 +707,8 @@ impl ClientConfig {
             retry_max: Some(Self::DEFAULT_RETRY_MAX),
             csv: CsvConfig::default(),
             staging_refresh_interval: Self::DEFAULT_STAGING_REFRESH,
+            rotation_queue_depth: Self::DEFAULT_ROTATION_QUEUE_DEPTH,
+            staging_error_after_attempts: Self::DEFAULT_STAGING_ERROR_AFTER_ATTEMPTS,
             lag_sample_interval: Duration::from_secs(30),
             state_heartbeat_interval: Duration::from_secs(4 * 3600),
             bypass_range_checks: false,

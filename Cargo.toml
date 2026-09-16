@@ -18,9 +18,10 @@ readme = "README.md"
 keywords = ["relyt", "ingest", "kafka", "arrow", "upsert"]
 categories = ["database"]
 # What `cargo package` ships. The integration suite, the CI helpers, the cargo
-# source-replacement config and any CI definition at the repository root are
-# bound to Relyt's internal infrastructure and are not part of the library.
-exclude = ["tests/", "ci/", ".cargo/", "/*.yml"]
+# source-replacement config, any CI definition at the repository root and the
+# internal performance record are bound to Relyt's internal infrastructure and
+# are not part of the library.
+exclude = ["tests/", "ci/", ".cargo/", "/*.yml", "perf.md"]
 
 [dependencies]
 # Locked to the customer's stack (they reported arrow-array 58.4.0 with

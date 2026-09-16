@@ -100,12 +100,18 @@ impl Client {
         //    fetch_table_schema; the PK requirement is per-mode, because only
         //    the upsert path needs an ON CONFLICT target.
         let schema = fetch_table_schema(&self.control, table).await?;
-        if self.cfg.stream_mode == StreamMode::Upsert && schema.pk.is_empty() {
-            return Err(Error::Schema(
-                "upsert mode requires the target table to have a primary key \
-                 (use StreamMode::InsertOnly for tables without one)"
-                    .into(),
-            ));
+        if self.cfg.stream_mode == StreamMode::Upsert {
+            if schema.pk.is_empty() {
+                return Err(Error::Schema(
+                    "upsert mode requires the target table to have a primary key \
+                     (use StreamMode::InsertOnly for tables without one)"
+                        .into(),
+                ));
+            }
+            // Only this mode deduplicates by key, so only this mode needs a
+            // key the dedup pass can hash -- and it has to fail here, not
+            // inside the pipeline where the rows are already sealed.
+            schema.validate_pk_for_dedup()?;
         }
 
         let ident = WriterIdentity {
@@ -316,7 +322,11 @@ impl Client {
             // heartbeat re-writes that value instead of None.
             new_state.resume_offset,
             // What recovery found staged above the watermark: the lag sampler
-            // starts from this list and appends every later rotation.
+            // starts from this list and appends every later seal. The time
+            // stamped here is the name's epoch -- the session these files
+            // were written in -- which is all a listing offers; it is older
+            // than their real seal time, so lag over-reports for them until
+            // the watermark passes them, never under-reports.
             plan.backfill
                 .iter()
                 .filter_map(|f| f.serial_seq().ok().map(|s| (s, f.epoch_ms)))

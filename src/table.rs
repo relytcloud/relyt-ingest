@@ -1,42 +1,58 @@
-//! `TableWriter`: buffered append + rotation + flush.
+//! `TableWriter`: buffered append + rotation pipeline + flush.
 //!
-//! `append` is non-blocking in the common case: batches go into an in-memory
-//! buffer and the call returns. Rotation (dedup -> CSV -> OSS put -> notify
-//! enqueue) happens when either threshold trips (size / age), on an explicit
-//! `flush`, or on the background age ticker. The customer contract: commit the
-//! Kafka offset only after `flush().await` returned (or `staged_offset()` >=
-//! the batch's last offset).
+//! `append` does no IO and no heavy CPU: batches go into an in-memory buffer
+//! and the call returns. When either rotation threshold trips (size / age),
+//! on an explicit `flush`, or on the background age ticker, the buffer is
+//! *sealed*: taken out whole, given the next serial seq, and handed to this
+//! writer's rotation pipeline -- three background stages, render (dedup +
+//! CSV) -> gzip -> put + notify, joined by bounded channels, each stage one
+//! task working through files in seq order, the CPU stages on the blocking
+//! pool so they never hold a tokio worker. The customer contract is
+//! unchanged: commit the Kafka offset only after `flush().await` returned
+//! (or `staged_offset()` >= the batch's last offset).
 //!
-//! Rotation is strictly serialised under the writer state lock, and that is
-//! load-bearing rather than incidental:
+//! Three invariants the serialised design held with one big lock are held
+//! here by construction:
 //!
-//! - the buffer is only ever drained by the task that will also put and
-//!   enqueue it, so a failed put can put the batches back (no silent hole
-//!   between "buffer emptied" and "object on OSS");
-//! - seqs are allocated, staged and announced in one critical section, so the
-//!   server sees a group's files in increasing seq order. Out-of-order
-//!   arrival would let a later file reach FINISH first, raise the group
+//! - **seq order.** Seqs are allocated under the state lock and the file is
+//!   handed over under `seal_lock`, so channel order is seq order; every
+//!   stage is a single task over a FIFO, so files reach the put stage, and
+//!   therefore the notify queue, in increasing seq. Out-of-order arrival at
+//!   the server would let a later file reach FINISH first, raise the group
 //!   watermark past an earlier seq, and make the server swallow that earlier
 //!   file as an already-consumed replay -- a silently skipped load.
+//! - **durable before announced.** `staged_offset` advances and the notify
+//!   request is enqueued only after the put returned, inside the put stage.
+//! - **no lost rows.** A sealed file is immutable and owned by the pipeline
+//!   until it is durable. A failed put retries the same bytes to the same
+//!   key (an idempotent overwrite) rather than returning rows to a buffer
+//!   they could be re-cut from under another seq; a stage that keeps failing
+//!   holds the pipeline, and `flush`/`close` report it as
+//!   [`Error::StagingStalled`] after `staging_error_after_attempts`. Nothing
+//!   is dropped short of the process exiting, at which point Kafka
+//!   re-delivers from the last committed offset -- what the contract above
+//!   exists for.
 //!
-//! The cost is that an `append` which trips the size threshold pays the OSS
-//! latency, and concurrent appends queue behind it. TODO: move rotation
-//! onto a dedicated writer task fed by a channel, which keeps the ordering
-//! guarantee without blocking producers.
+//! Backpressure: the seal -> render channel holds `rotation_queue_depth`
+//! files; while it is full, the `append` that trips a threshold waits. Memory
+//! per writer is bounded by (1 buffer + queue depth + files in flight across
+//! the three stages) x `rotate_size_bytes`; the sizing table in GUIDE.md
+//! spells it out.
 
 use std::cmp;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::MissedTickBehavior;
 
 use crate::config::{ClientConfig, StagingCompression, StreamMode};
 use crate::csv::CsvFormatter;
 use crate::dedup::dedup_last_wins;
 use crate::error::{Error, Result};
-use crate::naming::{StagedFile, WriterIdentity};
+use crate::naming::{StagedFile, WriterIdentity, MAX_SEQ};
 use crate::notify::{Notifier, NotifyRequest};
 use crate::schema::TableSchema;
 use crate::staging::{StagingHandle, StagingStore};
@@ -52,14 +68,21 @@ pub struct TableWriter {
 /// across traffic levels).
 #[derive(Debug, Clone)]
 pub struct LagSnapshot {
-    /// Age of the OLDEST staged file the server has not consumed yet
-    /// (derived from the file's creation epoch vs the server's group
-    /// watermark). 0 = fully caught up.
+    /// Age of the OLDEST file this writer has sealed and the server has not
+    /// consumed yet, measured from the moment it was sealed — so a file
+    /// still being rendered, compressed, uploaded or retried counts here,
+    /// not only one already on staging. 0 = fully caught up. Files that
+    /// recovery found on staging at open carry the epoch in their name
+    /// instead, which is older than their real seal time: they over-report,
+    /// never under-report.
     pub lag_seconds: u64,
-    /// Number of staged files above the server watermark.
+    /// Number of files sealed by this writer that are above the server
+    /// watermark, whether or not they have finished uploading.
     pub lag_files: usize,
-    /// Age of the oldest in-memory (not yet staged) batch — the batching
-    /// leg of the pipeline. 0 = empty buffer.
+    /// Age of the oldest row that is not yet durable on staging: still in
+    /// the buffer, or sealed and somewhere in the rotation pipeline (queued,
+    /// rendering, compressing, uploading or retrying an upload). 0 = nothing
+    /// pending. A storage outage shows up here first.
     pub buffered_age_seconds: u64,
     /// When this sample was taken.
     pub sampled_at: std::time::SystemTime,
@@ -102,9 +125,172 @@ struct WriterInner {
     /// compiler will not catch it -- CI runs
     /// `clippy::await_holding_lock` as a deny to cover both.
     fenced: std::sync::Mutex<Option<String>>,
+    /// Some(detail) once the put stage's order tripwire fired (see
+    /// `check_order`): every append/flush/close then fails with
+    /// StagingOrderViolation. Never reset, like `fenced`.
+    order_fatal: std::sync::Mutex<Option<String>>,
     /// Latest consumption-lag sample (see [`LagSnapshot`]); None until the
     /// first background sample lands.
     lag: std::sync::Mutex<Option<LagSnapshot>>,
+    /// Producer side of this writer's rotation pipeline (module docs).
+    pipeline: PipelineHandle,
+}
+
+/// What `append` / `flush` / the ticker hold of the rotation pipeline.
+struct PipelineHandle {
+    /// Sealed files -> render stage. Bounded by `rotation_queue_depth`: a
+    /// full queue is the backpressure that bounds memory.
+    tx: mpsc::Sender<Sealed>,
+    /// Taken across seal + send by everything that seals, so the order files
+    /// enter the channel is the order their seqs were allocated. tokio's
+    /// mutex, because the guard is held across the `send().await` that may
+    /// wait for queue room.
+    seal_lock: Mutex<()>,
+    /// What the pipeline has made durable / where it is stuck; `flush` and
+    /// `close` wait on this.
+    progress: watch::Receiver<Progress>,
+    /// The publishing side, shared with the stage tasks; the sealer uses it
+    /// to record a pipeline that has gone away so a waiting `flush` fails
+    /// instead of hanging.
+    progress_tx: Arc<watch::Sender<Progress>>,
+}
+
+/// Pipeline progress as seen by `flush`/`close`.
+#[derive(Clone, Debug, Default)]
+struct Progress {
+    /// serial_seq of the newest durable file. Files complete in seq order,
+    /// so every seq at or below it is durable too.
+    durable_seq: Option<i64>,
+    /// A stage keeps failing on one file; cleared when that file gets past
+    /// the stage (or becomes durable).
+    failing: Option<Failing>,
+}
+
+#[derive(Clone, Debug)]
+struct Failing {
+    /// The file that is failing; a `flush` waiting on an EARLIER seq is not
+    /// affected by it.
+    seq: i64,
+    /// Which stage reported it (`render` / `gzip` / `put`), named in the
+    /// error a waiter gets for a permanent failure.
+    stage: &'static str,
+    attempts: u32,
+    /// A deterministic failure (a row that cannot be rendered): retrying
+    /// cannot fix it, so a waiter hears about it at once AND is told that
+    /// waiting is not the remedy -- `RotationFailed`, not `StagingStalled`.
+    permanent: bool,
+    /// The underlying error, kept for a permanent failure so the caller sees
+    /// what actually broke instead of a storage-shaped paraphrase. `Arc`:
+    /// every waiter on this writer is handed the same one.
+    cause: Option<Arc<Error>>,
+    /// What kind of failure this is, which decides the error a waiter gets.
+    kind: FailKind,
+    last: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailKind {
+    /// A stage keeps failing on the file: `StagingStalled` once the attempt
+    /// threshold is reached (or at once when permanent).
+    Stage,
+    /// The stage tasks are gone (writer being dropped, or a bug):
+    /// `WriterClosed`.
+    PipelineGone,
+    /// The writer was fenced and its stages stopped: `WriterFenced`. Without
+    /// this a `flush` already waiting when the fence lands would never wake
+    /// -- the writer itself holds a sender on the progress channel, so the
+    /// channel does not close when the stages exit.
+    Fenced,
+    /// The put stage's order tripwire fired and the stages stopped:
+    /// `StagingOrderViolation`, for the same reason as `Fenced`.
+    OrderViolation,
+}
+
+/// Publish a terminal state on the progress channel unless one is already
+/// there. The three terminal kinds are written from different tasks and can
+/// race (a fence landing after the order tripwire fired, a gone pipeline
+/// after either); the first one to land is the real cause and the one whose
+/// remedy matters, so it stays. Returns whether this call wrote it.
+fn publish_terminal(progress: &watch::Sender<Progress>, kind: FailKind, last: String) -> bool {
+    progress.send_if_modified(|p| match &p.failing {
+        Some(f) if f.kind != FailKind::Stage => false,
+        _ => {
+            p.failing = Some(Failing {
+                seq: i64::MIN,
+                stage: "pipeline",
+                attempts: 0,
+                permanent: true,
+                cause: None,
+                kind,
+                last,
+            });
+            true
+        }
+    })
+}
+
+/// The error a `Failing` entry stands for, once it qualifies (see
+/// `WriterInner::stall_error`).
+fn terminal_error(f: &Failing) -> Error {
+    match f.kind {
+        // Permanent means retrying cannot fix it: say so, and hand back the
+        // error itself. StagingStalled promises the opposite ("keep
+        // flushing, it will clear"), which would be an endless loop here.
+        FailKind::Stage => match &f.cause {
+            Some(cause) => Error::RotationFailed {
+                stage: f.stage,
+                source: Arc::clone(cause),
+            },
+            None => Error::StagingStalled {
+                attempts: f.attempts,
+                last: f.last.clone(),
+            },
+        },
+        FailKind::PipelineGone => Error::WriterClosed,
+        FailKind::Fenced => Error::WriterFenced(f.last.clone()),
+        FailKind::OrderViolation => Error::StagingOrderViolation(f.last.clone()),
+    }
+}
+
+/// A rotation unit as cut out of the buffer: identity, bookkeeping and the
+/// batches. Immutable from here on -- see the module docs for why.
+struct Sealed {
+    meta: FileMeta,
+    batches: Vec<RecordBatch>,
+}
+
+/// The file's identity and timings, carried through every stage.
+struct FileMeta {
+    file: StagedFile,
+    serial_seq: i64,
+    identifier: String,
+    object_key: String,
+    /// Rows in the buffer before dedup (the `deduped` log field).
+    rows_in: usize,
+    sealed_at: Instant,
+    /// Wall time waiting for the render stage.
+    queue_ms: u64,
+    render_ms: u64,
+    gzip_ms: u64,
+}
+
+/// Render stage output: the CSV body and how many rows survived dedup.
+struct Rendered {
+    meta: FileMeta,
+    body: Arc<String>,
+    rows: usize,
+}
+
+/// Gzip stage output: the bytes to put. `Buffer`, not `Vec`: a retry after a
+/// credential refresh needs the bytes again and a `Buffer` clone is a
+/// reference count, not a copy.
+struct Compressed {
+    meta: FileMeta,
+    payload: opendal::Buffer,
+    rows: usize,
+    /// Rendered CSV size -- what the rotation threshold is calibrated on.
+    bytes: usize,
+    stored_bytes: usize,
 }
 
 struct WriterState {
@@ -128,11 +314,21 @@ struct WriterState {
     /// the rotation lock; a failed rotation does NOT return its seq — the
     /// hole is harmless, reuse could bind two files to one seq.
     next_seq: u32,
-    /// Every file this writer knows to be staged and not yet consumed, as
-    /// (serial_seq, epoch_ms): seeded from the recovery listing at open, one
-    /// entry appended per rotation, pruned by the lag sampler as the server
-    /// watermark passes them. The lag numbers are computed from this list.
+    /// Every file this writer knows to be sealed or staged and not yet
+    /// consumed, as (serial_seq, sealed_at_ms): one entry appended per seal
+    /// (NOT per upload: a file stuck in the pipeline must count as lag, or a
+    /// storage outage reads as "caught up"), pruned by the lag sampler as
+    /// the server watermark passes them. The lag numbers are computed from
+    /// this list, and `lag_seconds` is `now - sealed_at_ms` of the oldest
+    /// entry -- so the time must be the FILE's, not the session epoch,
+    /// which stays put for the life of the writer and would make the value
+    /// read as "time since open". Entries seeded from the recovery listing
+    /// at open carry the name's epoch instead (all the name has); those are
+    /// older than the truth, so they over-report, never under-report.
     known_files: Vec<(i64, u64)>,
+    /// Files sealed but not yet durable, as (serial_seq, sealed_at): what the
+    /// `buffered_age_seconds` signal covers besides the buffer itself.
+    in_flight: Vec<(i64, Instant)>,
     /// Rows currently buffered (for the CSV-byte size estimate).
     buffered_rows: usize,
     /// Average CSV bytes per surviving row, measured on the last rotation.
@@ -141,6 +337,17 @@ struct WriterState {
     avg_row_bytes: Option<f64>,
     /// Highest Kafka end-offset that is durably staged (file on OSS).
     staged_offset: Option<i64>,
+    /// serial_seq of the last file handed to the pipeline: what a `flush`
+    /// that finds the buffer empty waits for.
+    last_sealed_seq: Option<i64>,
+    /// Highest Kafka end-offset appended to THIS writer instance (buffered
+    /// or sealed). `append` refuses a batch that starts at or before it:
+    /// offsets going backwards means the consumer was rewound, and the
+    /// right move is to reopen the table and resume from the recovery
+    /// plan, not to re-append into a writer that already holds those rows.
+    /// Per instance on purpose -- a reopened writer starts at None so a
+    /// replay of pre-crash offsets after recovery is not refused.
+    max_end_offset: Option<i64>,
     /// resume_offset recorded in the last state.json write, so the ticker
     /// only pays for a write when the confirmation actually moved. Seeded at
     /// open with the value recovered from state.json: it must never regress
@@ -167,6 +374,9 @@ impl TableWriter {
         instance_uuid: String,
     ) -> Self {
         let serial_group = ident.serial_group();
+        let (seal_tx, seal_rx) = mpsc::channel(cfg.rotation_queue_depth.max(1));
+        let (progress_tx, progress_rx) = watch::channel(Progress::default());
+        let progress_tx = Arc::new(progress_tx);
         let inner = Arc::new(WriterInner {
             state: Mutex::new(WriterState {
                 buffered: Vec::new(),
@@ -177,8 +387,11 @@ impl TableWriter {
                 epoch_ms: initial_epoch_ms,
                 next_seq: 0,
                 staged_offset,
+                last_sealed_seq: None,
+                max_end_offset: None,
                 resume_persisted,
                 known_files,
+                in_flight: Vec::new(),
                 state_written_at: Instant::now(),
             }),
             schema,
@@ -190,8 +403,16 @@ impl TableWriter {
             notifier,
             instance_uuid,
             fenced: std::sync::Mutex::new(None),
+            order_fatal: std::sync::Mutex::new(None),
             lag: std::sync::Mutex::new(None),
+            pipeline: PipelineHandle {
+                tx: seal_tx,
+                seal_lock: Mutex::new(()),
+                progress: progress_rx,
+                progress_tx: progress_tx.clone(),
+            },
         });
+        spawn_pipeline(&inner, seal_rx, progress_tx);
         spawn_ticker(&inner);
         spawn_gc(&inner);
         spawn_lock_heartbeat(&inner);
@@ -218,6 +439,14 @@ impl TableWriter {
 
     /// Buffered append: enqueue `batch` covering Kafka offsets
     /// `[start_offset, end_offset]` and return. Durability comes from `flush`.
+    ///
+    /// **Call this serially for a given writer**, from one task, with
+    /// offsets moving forward — the shape a partition's consume loop has
+    /// anyway. Offsets are checked against the highest this writer has
+    /// taken, so concurrent callers interleaving their ranges will see each
+    /// other's batches rejected as a rewind ([`Error::Config`]). Feed
+    /// several partitions through several writers, not one writer through
+    /// several tasks.
     pub async fn append(
         &self,
         batch: RecordBatch,
@@ -240,8 +469,25 @@ impl TableWriter {
                 "append batch schema != table schema (column names / types)".into(),
             ));
         }
-        let should_rotate = {
+        let (should_rotate, prev_max_end) = {
             let mut st = self.inner.state.lock().await;
+            // Caller-side input, checked here and now rather than by the
+            // pipeline's order tripwire (which guards SDK-internal seqs):
+            // a rewound consumer must not silently re-append into a writer
+            // that already holds those offsets.
+            if let Some(max_end) = st.max_end_offset {
+                if start_offset <= max_end {
+                    return Err(Error::Config(format!(
+                        "Kafka offsets went backwards: batch [{start_offset}, {end_offset}] starts \
+                         at or before the last appended end offset {max_end}; the batch was not \
+                         buffered. If the consumer was rewound (rebalance, seek), reopen the table \
+                         and resume from RecoveryPlan::kafka_resume_offset instead of re-appending \
+                         to this writer."
+                    )));
+                }
+            }
+            let prev_max_end = st.max_end_offset;
+            st.max_end_offset = Some(end_offset);
             st.buffered_bytes_estimate += batch.get_array_memory_size() as u64;
             st.buffered_rows += batch.num_rows();
             st.buffered.push((batch, start_offset, end_offset));
@@ -258,23 +504,48 @@ impl TableWriter {
                 Some(avg) => (st.buffered_rows as f64 * avg) as u64,
                 None => st.buffered_bytes_estimate,
             };
-            est_bytes >= self.inner.cfg.rotate_size_bytes
+            let rotate = est_bytes >= self.inner.cfg.rotate_size_bytes
                 || st
                     .oldest_buffered_at
                     .map(|t| t.elapsed() >= self.inner.cfg.rotate_interval_max)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+            (rotate, prev_max_end)
         };
         if should_rotate {
-            self.inner.rotate().await?;
+            // Hands the buffer to the pipeline. Waits while the queue is
+            // full (backpressure), never for the upload itself; if, while
+            // waiting, the pipeline turns out to be stuck (see
+            // StagingStalled) it gives up instead -- the common append*N ->
+            // flush loop would otherwise park here and never reach the
+            // flush that reports the stall. Nothing was sealed when that
+            // happens, so this call's batch is taken back out: an Err from
+            // append means "not accepted, retry later".
+            if let Err(e) = self.inner.seal_and_send(false, true).await {
+                let taken_back = self
+                    .inner
+                    .unbuffer(start_offset, end_offset, prev_max_end)
+                    .await;
+                // Could not take it back: a concurrent sealer already handed
+                // this batch to the pipeline, so it IS accepted and saying
+                // otherwise would have the caller append it twice. A stall
+                // then surfaces at the next `flush`; a terminal writer state
+                // still propagates, since that caller must stop either way.
+                if taken_back || !matches!(e, Error::StagingStalled { .. }) {
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
 
-    /// Force-stage everything buffered; returns the staged offset (highest
-    /// Kafka end-offset durable on OSS) after the write.
+    /// Force-stage everything buffered and wait until it is durable on
+    /// staging storage; returns the staged offset (highest Kafka end-offset
+    /// durable) after the write. Fails with [`Error::StagingStalled`] when
+    /// the pipeline is stuck (see there); nothing is lost and a later call
+    /// waits again.
     pub async fn flush(&self) -> Result<Option<i64>> {
         self.inner.check_health()?;
-        self.inner.rotate().await?;
+        self.inner.flush_pipeline().await?;
         Ok(self.inner.state.lock().await.staged_offset)
     }
 
@@ -313,11 +584,19 @@ impl TableWriter {
     /// A fenced writer has nothing to drain (writes were already refused)
     /// and the lease belongs to its successor — `close` then returns the
     /// fencing error and touches nothing.
+    ///
+    /// `close` takes `self`, so the writer is gone whatever it returns.
+    /// On an error there is nothing left to retry on: anything still
+    /// buffered or in flight is dropped with the writer. That is safe as
+    /// long as the contract is kept — Kafka offsets are committed only
+    /// behind `staged_offset()` — because the next process resumes from
+    /// [`RecoveryPlan::kafka_resume_offset`](crate::RecoveryPlan) and
+    /// replays them. Call `flush()` first if you want to see (and wait out)
+    /// a stalled pipeline while the writer is still usable.
     pub async fn close(self) -> Result<Option<i64>> {
-        if let Some(reason) = self.inner.fenced.lock().unwrap().clone() {
-            return Err(Error::WriterFenced(reason));
-        }
-        self.inner.rotate().await?;
+        // Same gate as append/flush: fenced, order tripwire, serial fatal.
+        self.inner.check_health()?;
+        self.inner.flush_pipeline().await?;
         self.inner.persist_state_if_due().await;
         let staged = self.inner.state.lock().await.staged_offset;
         if let Ok(Some(l)) = self.inner.store().read_lock(&self.inner.ident).await {
@@ -350,6 +629,12 @@ impl WriterInner {
     }
 
     fn check_health(&self) -> Result<()> {
+        // The order violation goes first: it is the one that needs a human
+        // to rewind offsets, and a fence landing afterwards must not hide
+        // that from the caller.
+        if let Some(detail) = self.order_fatal.lock().unwrap().clone() {
+            return Err(Error::StagingOrderViolation(detail));
+        }
         if let Some(reason) = self.fenced.lock().unwrap().clone() {
             return Err(Error::WriterFenced(reason));
         }
@@ -359,43 +644,21 @@ impl WriterInner {
         }
     }
 
-    /// Rotate the current buffer into exactly one staged CSV object + one
-    /// notify request. One append burst = at most one object per rotation
-    /// under the double threshold.
-    ///
-    /// Runs entirely under the state lock — see the module docs for why the
-    /// drain/put/enqueue triple must not be split.
-    async fn rotate(&self) -> Result<()> {
-        let rotate_started = Instant::now();
-        let mut st = self.state.lock().await;
-        if st.buffered.is_empty() {
-            return Ok(());
+    /// Cut the whole buffer into one file and give it the next seq. With
+    /// `aged_only`, only when the oldest buffered row has aged past
+    /// `rotate_interval_max` (the ticker's path). None when there is nothing
+    /// to seal. Runs under the state lock the caller holds; does no IO.
+    fn seal(&self, st: &mut WriterState, aged_only: bool) -> Result<Option<Sealed>> {
+        if !self.sealable(st, aged_only) {
+            return Ok(None);
         }
-
-        // Everything needed to undo the drain if staging fails. The consumed
-        // (epoch, seq) is deliberately NOT part of the rollback: a retry uses
-        // a fresh seq and the failed one stays a hole. Holes are harmless --
-        // the group watermark is a high-water mark and the scheduler only
-        // gates on rows that exist -- whereas REUSING a seq after a put of
-        // unknown fate risks two different objects claiming one seq if the
-        // first write actually landed.
-        let prev_bytes = st.buffered_bytes_estimate;
-        let prev_oldest = st.oldest_buffered_at;
-
-        let prev_rows = st.buffered_rows;
-        let batches: Vec<(RecordBatch, i64, i64)> = std::mem::take(&mut st.buffered);
-        st.buffered_bytes_estimate = 0;
-        st.buffered_rows = 0;
-        st.oldest_buffered_at = None;
-
-        let start = batches.iter().map(|(_, s, _)| *s).min().unwrap();
-        let end = batches.iter().map(|(_, _, e)| *e).max().unwrap();
-
-        if st.next_seq > crate::naming::MAX_SEQ {
+        if st.next_seq > MAX_SEQ {
             // Seq exhausted: roll to a fresh epoch.
             st.epoch_ms += 1;
             st.next_seq = 0;
         }
+        let start = st.buffered.iter().map(|(_, s, _)| *s).min().unwrap();
+        let end = st.buffered.iter().map(|(_, _, e)| *e).max().unwrap();
         let file = StagedFile {
             epoch_ms: st.epoch_ms,
             seq: st.next_seq,
@@ -403,187 +666,357 @@ impl WriterInner {
             end_offset: end,
             compressed: self.cfg.staging_compression == StagingCompression::Gzip,
         };
-        st.next_seq += 1;
-
-        // Encode the serial_seq and identifier BEFORE any IO: an
-        // out-of-range epoch must fail here, not after a successful put
-        // where it would strand an orphan object the server was never told
-        // about and the rollback cannot classify.
+        // Encode the serial_seq and identifier BEFORE consuming anything: an
+        // out-of-range epoch fails here with the buffer intact, not after a
+        // put that would strand an orphan object the server was never told
+        // about.
         let serial_seq = file.serial_seq()?;
         let identifier = file.identifier(&self.ident)?;
         let object_key = file.object_key(&self.ident);
+        // The seq is spent even if the file needs retries: the pipeline
+        // retries the SAME bytes under the same seq and key, so no second
+        // object can ever claim it.
+        st.next_seq += 1;
+        let rows_in = st.buffered_rows;
+        let batches = std::mem::take(&mut st.buffered)
+            .into_iter()
+            .map(|(b, _, _)| b)
+            .collect();
+        st.buffered_bytes_estimate = 0;
+        st.buffered_rows = 0;
+        st.oldest_buffered_at = None;
+        st.last_sealed_seq = Some(serial_seq);
+        // Visible to the lag sampler from this moment, not from the upload:
+        // between seal and durable the rows are in neither the buffer nor
+        // staging, and that window is exactly where a storage outage lives.
+        // Stamped with the wall clock of the seal, not `file.epoch_ms`: the
+        // epoch is fixed for the session, and lag_seconds measures file age.
+        let sealed_at = Instant::now();
+        st.known_files.push((serial_seq, crate::lock::now_ms()));
+        st.in_flight.push((serial_seq, sealed_at));
+        Ok(Some(Sealed {
+            meta: FileMeta {
+                file,
+                serial_seq,
+                identifier,
+                object_key,
+                rows_in,
+                sealed_at,
+                queue_ms: 0,
+                render_ms: 0,
+                gzip_ms: 0,
+            },
+            batches,
+        }))
+    }
 
-        let restore = |st: &mut WriterState, batches: Vec<(RecordBatch, i64, i64)>| {
-            // Nothing else can have touched the buffer: appends need the same
-            // lock, which this task holds for the whole rotation.
-            st.buffered = batches;
-            st.buffered_bytes_estimate = prev_bytes;
-            st.buffered_rows = prev_rows;
-            st.oldest_buffered_at = prev_oldest.or_else(|| Some(Instant::now()));
-        };
+    /// Whether `seal` would produce a file right now: a non-empty buffer,
+    /// and with `aged_only` one whose oldest row has aged past
+    /// `rotate_interval_max`.
+    fn sealable(&self, st: &WriterState, aged_only: bool) -> bool {
+        !st.buffered.is_empty()
+            && (!aged_only
+                || st
+                    .oldest_buffered_at
+                    .map(|t| t.elapsed() >= self.cfg.rotate_interval_max)
+                    .unwrap_or(false))
+    }
 
-        let avg_row_bytes = st.avg_row_bytes;
-        let staged_stats = match self.stage(&batches, &object_key, avg_row_bytes).await {
-            Ok(stats) => stats,
-            Err(e) => {
-                restore(&mut st, batches);
-                return Err(e);
-            }
+    /// Seal whatever is buffered and hand it to the pipeline. Returns the
+    /// file's serial_seq; None when nothing was buffered.
+    ///
+    /// Queue room is reserved BEFORE the buffer is cut, so the hand-over
+    /// itself never blocks and nothing ever has to be un-sealed. The wait
+    /// for room is the backpressure. With `surface_stall`, a caller that
+    /// would have to park -- the seal lock held by another sealer, or the
+    /// queue full -- waits only until the pipeline reports a file that
+    /// keeps failing, and then gives up with [`Error::StagingStalled`]
+    /// rather than sit behind a storage outage indefinitely; while there is
+    /// room the batch is taken regardless (that is what the queue is for).
+    /// Without it (the ticker) the wait is unconditional.
+    async fn seal_and_send(&self, aged_only: bool, surface_stall: bool) -> Result<Option<i64>> {
+        let _order = match self.pipeline.seal_lock.try_lock() {
+            Ok(g) => g,
+            Err(_) if surface_stall => tokio::select! {
+                g = self.pipeline.seal_lock.lock() => g,
+                e = self.until_stalled(i64::MAX) => return Err(e),
+            },
+            Err(_) => self.pipeline.seal_lock.lock().await,
         };
-        if staged_stats.rows > 0 {
-            st.avg_row_bytes = Some(staged_stats.bytes as f64 / staged_stats.rows as f64);
+        let anything = {
+            let st = self.state.lock().await;
+            self.sealable(&st, aged_only)
+        };
+        if !anything {
+            return Ok(None);
         }
+        let permit = match self.pipeline.tx.try_reserve() {
+            Ok(p) => Ok(p),
+            Err(TrySendError::Closed(())) => Err(()),
+            Err(TrySendError::Full(())) if surface_stall => tokio::select! {
+                p = self.pipeline.tx.reserve() => p.map_err(|_| ()),
+                e = self.until_stalled(i64::MAX) => return Err(e),
+            },
+            Err(TrySendError::Full(())) => self.pipeline.tx.reserve().await.map_err(|_| ()),
+        };
+        let Ok(permit) = permit else {
+            // The stages exit on a fence or a tripped tripwire too: name
+            // that cause when it is the one, not "pipeline gone".
+            self.check_health()?;
+            return Err(self.pipeline_gone());
+        };
+        // The wait may have been long: a writer fenced meanwhile must not
+        // cut and stage anything more.
+        self.check_health()?;
+        let sealed = {
+            let mut st = self.state.lock().await;
+            self.seal(&mut st, aged_only)?
+        };
+        // Only sealers touch the buffer and all of them hold seal_lock, so
+        // the buffer seen above can only have grown; None is unreachable in
+        // practice and harmless if it ever happens.
+        let Some(sealed) = sealed else {
+            return Ok(None);
+        };
+        let seq = sealed.meta.serial_seq;
+        permit.send(sealed);
+        Ok(Some(seq))
+    }
 
-        // Durable now: record the offset, then announce it. An enqueue failure
-        // means the notify task is gone (process shutting down); the object is
-        // on OSS, so recovery backfill still owns it -- do not roll back.
-        st.staged_offset = Some(match st.staged_offset {
-            Some(prev) => prev.max(file.end_offset),
-            None => file.end_offset,
-        });
-        st.known_files.push((serial_seq, file.epoch_ms));
+    /// The ticker's path: seal an aged buffer without ever waiting. Skips
+    /// the tick when another sealer is mid-handover or the queue is full;
+    /// the next tick (or the next `append`) picks the buffer up.
+    async fn seal_if_aged_nonblocking(&self) -> Result<()> {
+        // Same gate as append/flush: a fenced writer must not stage anything
+        // more, whatever path asks for it.
+        self.check_health()?;
+        let Ok(_order) = self.pipeline.seal_lock.try_lock() else {
+            return Ok(());
+        };
+        // Full or closed: either way not this tick's problem.
+        let Ok(permit) = self.pipeline.tx.try_reserve() else {
+            return Ok(());
+        };
+        let sealed = {
+            let mut st = self.state.lock().await;
+            self.seal(&mut st, true)?
+        };
+        if let Some(sealed) = sealed {
+            permit.send(sealed);
+        }
+        Ok(())
+    }
+
+    /// The render stage has exited, which only happens while this writer is
+    /// being dropped (or on a bug). Nothing was sealed; make sure a `flush`
+    /// waiting on an earlier file does not hang on a pipeline that will
+    /// never answer.
+    fn pipeline_gone(&self) -> Error {
+        let mut err = Error::WriterClosed;
+        self.pipeline
+            .progress_tx
+            .send_if_modified(|p| match &p.failing {
+                // An earlier terminal state (fenced, tripwire) is the real
+                // cause of the stages being gone: keep it and report it.
+                Some(f) if f.kind != FailKind::Stage => {
+                    err = terminal_error(f);
+                    false
+                }
+                _ => {
+                    p.failing = Some(Failing {
+                        seq: i64::MIN,
+                        stage: "pipeline",
+                        attempts: 0,
+                        permanent: true,
+                        cause: None,
+                        kind: FailKind::PipelineGone,
+                        last: "rotation pipeline is gone".into(),
+                    });
+                    true
+                }
+            });
+        err
+    }
+
+    /// Take one `append`'s batch back out of the buffer after its hand-over
+    /// failed. Returns whether it was still there: a concurrent sealer (the
+    /// ticker, or a `flush` on another task) may have taken the whole buffer
+    /// — this batch included — while this call was waiting for queue room,
+    /// and a batch that is already in the pipeline must NOT be handed back,
+    /// or the caller would append it a second time.
+    ///
+    /// Searched from the back: with one producer per writer it is the last
+    /// entry. The offset high-water mark is restored only together with the
+    /// batch, and only when this batch is the one that set it.
+    async fn unbuffer(
+        &self,
+        start_offset: i64,
+        end_offset: i64,
+        prev_max_end: Option<i64>,
+    ) -> bool {
+        let mut st = self.state.lock().await;
+        let Some(i) = st
+            .buffered
+            .iter()
+            .rposition(|(_, s, e)| *s == start_offset && *e == end_offset)
+        else {
+            return false;
+        };
+        let (batch, _, _) = st.buffered.remove(i);
+        st.buffered_bytes_estimate = st
+            .buffered_bytes_estimate
+            .saturating_sub(batch.get_array_memory_size() as u64);
+        st.buffered_rows = st.buffered_rows.saturating_sub(batch.num_rows());
+        if st.buffered.is_empty() {
+            st.oldest_buffered_at = None;
+        }
+        if st.max_end_offset == Some(end_offset) {
+            st.max_end_offset = prev_max_end;
+        }
+        true
+    }
+
+    /// Seal what is buffered and wait until it -- and so everything sealed
+    /// before it -- is durable.
+    async fn flush_pipeline(&self) -> Result<()> {
+        let target = match self.seal_and_send(false, true).await? {
+            Some(seq) => Some(seq),
+            None => self.state.lock().await.last_sealed_seq,
+        };
+        match target {
+            Some(t) => self.await_durable(t).await,
+            None => Ok(()),
+        }
+    }
+
+    /// What a caller waiting on `target` (or on anything: `i64::MAX`) is
+    /// owed once the pipeline is stuck: Some when the failing file is at or
+    /// before `target` and has either failed for good or
+    /// `staging_error_after_attempts` times in a row.
+    fn stall_error(&self, p: &Progress, target: i64) -> Option<Error> {
+        let f = p.failing.as_ref()?;
+        if f.seq > target || !(f.permanent || f.attempts >= self.cfg.staging_error_after_attempts) {
+            return None;
+        }
+        Some(terminal_error(f))
+    }
+
+    /// Resolves when the pipeline is stuck on a file at or before `target`
+    /// (see `stall_error`), or when every stage task is gone.
+    async fn until_stalled(&self, target: i64) -> Error {
+        let mut rx = self.pipeline.progress.clone();
+        loop {
+            if let Some(e) = self.stall_error(&rx.borrow_and_update(), target) {
+                return e;
+            }
+            // `changed()` fails only once every sender is gone, which cannot
+            // happen while this writer lives (it holds one itself); the
+            // stages report their exits through `failing` instead. The arm
+            // handles the Result and gives the right answer if it ever
+            // fires.
+            if rx.changed().await.is_err() {
+                return Error::WriterClosed;
+            }
+        }
+    }
+
+    /// Wait until the file with serial_seq `target` is durable, or the
+    /// pipeline is stuck on it or a file before it (see `stall_error`).
+    async fn await_durable(&self, target: i64) -> Result<()> {
+        let mut rx = self.pipeline.progress.clone();
+        loop {
+            {
+                let p = rx.borrow_and_update();
+                if p.durable_seq.is_some_and(|d| d >= target) {
+                    return Ok(());
+                }
+                if let Some(e) = self.stall_error(&p, target) {
+                    return Err(e);
+                }
+            }
+            // See `until_stalled` on why this arm is not expected to fire.
+            if rx.changed().await.is_err() {
+                return Err(Error::WriterClosed);
+            }
+        }
+    }
+
+    /// The order tripwire fired: record why, so every append/flush/close
+    /// fails with it from now on. Never reset -- the gap it names is not
+    /// something a running writer can repair.
+    fn trip_order_fatal(&self, detail: String) {
+        tracing::error!(group = %self.serial_group, "{detail}");
+        {
+            let mut slot = self.order_fatal.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(detail.clone());
+            }
+        }
+        // Wake anyone already parked in flush/close: the stages stop here
+        // and nothing else will ever move the progress channel.
+        publish_terminal(&self.pipeline.progress_tx, FailKind::OrderViolation, detail);
+    }
+
+    /// The put returned, so the file is durable: record the offset, then
+    /// announce the file. The caller publishes progress AFTER this, so a
+    /// `flush` woken by it reads the advanced offset.
+    async fn record_durable(
+        &self,
+        meta: &FileMeta,
+        rows: usize,
+        bytes: usize,
+        stored_bytes: usize,
+        put_ms: u64,
+    ) {
+        {
+            let mut st = self.state.lock().await;
+            st.staged_offset = Some(match st.staged_offset {
+                Some(prev) => prev.max(meta.file.end_offset),
+                None => meta.file.end_offset,
+            });
+            // known_files got this file at seal time; only the in-flight
+            // bookkeeping ends here.
+            st.in_flight.retain(|(s, _)| *s != meta.serial_seq);
+        }
         tracing::info!(
             db = %self.names.0,
             table = %format!("{}.{}", self.names.1, self.names.2),
             writer_id = %self.ident.writer_id,
-            object = %format!("{}/{}", self.url_base(), object_key),
-            start_offset = file.start_offset,
-            end_offset = file.end_offset,
-            rows = staged_stats.rows,
-            deduped = prev_rows.saturating_sub(staged_stats.rows),
-            bytes = staged_stats.bytes,
-            stored_bytes = staged_stats.stored_bytes,
-            serial_seq,
-            elapsed_ms = rotate_started.elapsed().as_millis() as u64,
+            object = %format!("{}/{}", self.url_base(), meta.object_key),
+            start_offset = meta.file.start_offset,
+            end_offset = meta.file.end_offset,
+            rows,
+            deduped = meta.rows_in.saturating_sub(rows),
+            bytes,
+            stored_bytes,
+            serial_seq = meta.serial_seq,
+            queue_ms = meta.queue_ms,
+            render_ms = meta.render_ms,
+            gzip_ms = meta.gzip_ms,
+            put_ms,
+            elapsed_ms = ms(meta.sealed_at.elapsed()),
             "staged file durable"
         );
         // Serial fields are unconditional: insert-only streams run with M=1
-        // serialization too — that is what gives them a server-side group
+        // serialization too -- that is what gives them a server-side group
         // watermark for recovery pruning. Only the upsert load mode and the
-        // intra-file PK dedup stay Upsert-specific.
-        self.notifier.enqueue(NotifyRequest {
+        // intra-file PK dedup stay Upsert-specific. An enqueue failure means
+        // the notify task is gone (process shutting down); the object is on
+        // storage, so recovery backfill still owns it.
+        if let Err(e) = self.notifier.enqueue(NotifyRequest {
             serial_group: self.serial_group.clone(),
-            end_offset: file.end_offset,
-            identifier,
-            source_url: format!("{}/{}", self.url_base(), object_key),
+            end_offset: meta.file.end_offset,
+            identifier: meta.identifier.clone(),
+            source_url: format!("{}/{}", self.url_base(), meta.object_key),
             target: self.ident.rel_oid,
             delimiter: self.cfg.csv.delimiter,
             upsert: self.cfg.stream_mode == StreamMode::Upsert,
-            serial_seq,
+            serial_seq: meta.serial_seq,
             retry_max: self.cfg.retry_max.or(Some(-1)),
-        })?;
-        Ok(())
-    }
-
-    /// Dedup + serialize + put. Split out so `rotate` has a single fallible
-    /// step to roll back around. Returns the surviving row count and the
-    /// rendered CSV size, which calibrate the size threshold.
-    ///
-    /// `avg_row_bytes` is the previous rotation's measurement (None on the
-    /// first one) and only sizes the output buffer up front.
-    async fn stage(
-        &self,
-        batches: &[(RecordBatch, i64, i64)],
-        object_key: &str,
-        avg_row_bytes: Option<f64>,
-    ) -> Result<StageStats> {
-        // 1. Intra-file PK dedup, last write wins (hard requirement).
-        let only_batches: Vec<RecordBatch> = batches.iter().map(|(b, _, _)| b.clone()).collect();
-        let keep = if self.cfg.stream_mode == StreamMode::Upsert {
-            dedup_last_wins(&only_batches, &self.schema.pk_indices()?)?
-        } else {
-            only_batches
-                .iter()
-                .map(|b| (0..b.num_rows()).collect())
-                .collect()
-        };
-
-        // 2. Serialize to CSV (header always on).
-        let fmt = CsvFormatter::new(self.cfg.csv.delimiter);
-        let names: Vec<&str> = self
-            .schema
-            .arrow
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        let mut body = fmt.header(&names);
-        // Reserve the whole file up front from the measured average: without
-        // it a 64MB body grows through ~20 reallocation +
-        // copy rounds, all under the rotation lock.
-        {
-            let rows_total: usize = keep.iter().map(|r| r.len()).sum();
-            let per_row = avg_row_bytes.unwrap_or(128.0).max(1.0);
-            let est = (rows_total as f64 * per_row) as usize;
-            body.reserve(est.min(MAX_CSV_RESERVE));
+        }) {
+            tracing::error!(error = %e, serial_seq = meta.serial_seq, group = %self.serial_group,
+                "staged file could not be handed to the notify queue; recovery backfill owns it");
         }
-        let mut kept_rows = 0usize;
-        for (b, rows) in only_batches.iter().zip(keep.iter()) {
-            kept_rows += rows.len();
-            fmt.format_rows(b, rows, &mut body)?;
-        }
-        let bytes = body.len();
-
-        // 3. Optional gzip, then a deterministic-name put (a retry overwrites
-        //    the same object). Level 6 (the default) is the bandwidth/CPU
-        //    sweet spot for CSV; the backend is zlib-rs (see Cargo.toml),
-        //    which is where most of a rotation's CPU goes. The server sniffs
-        //    the magic bytes, no option needed.
-        let payload = if self.cfg.staging_compression == StagingCompression::Gzip {
-            use std::io::Write;
-            let mut enc = flate2::write::GzEncoder::new(
-                Vec::with_capacity(bytes / 4),
-                flate2::Compression::default(),
-            );
-            enc.write_all(body.as_bytes())
-                .and_then(|_| enc.finish())
-                .map_err(|e| Error::Config(format!("gzip of staged CSV failed: {e}")))?
-        } else {
-            body.into_bytes()
-        };
-        let stored_bytes = payload.len();
-        // Buffer, not Vec: a retry after a credential refresh needs the bytes
-        // again, and a Buffer clone is a reference count, not a copy.
-        let payload = opendal::Buffer::from(payload);
-        if let Err(e) = self.store().put(object_key, payload.clone()).await {
-            // A denied upload under Relyt-managed staging is most likely a key
-            // the master has since rotated: refresh once, and retry once only
-            // if that produced a different key. Anything else propagates.
-            let denied =
-                matches!(&e, Error::Storage(s) if s.kind() == opendal::ErrorKind::PermissionDenied);
-            if !(denied
-                && crate::client::refresh_managed_staging(&self.staging, "upload denied").await?)
-            {
-                return Err(e);
-            }
-            self.store().put(object_key, payload).await?;
-        }
-        Ok(StageStats {
-            rows: kept_rows,
-            bytes,
-            stored_bytes,
-        })
-    }
-
-    /// Rotate if the oldest buffered row has aged past `rotate_interval_max`.
-    /// The threshold is evaluated here rather than only inside `append` so it
-    /// still fires when the partition goes idle mid-buffer.
-    async fn rotate_if_aged(&self) -> Result<()> {
-        // Same gate as append/flush: a fenced writer must not stage anything
-        // more, whatever path asks for it.
-        self.check_health()?;
-        let aged = {
-            let st = self.state.lock().await;
-            !st.buffered.is_empty()
-                && st
-                    .oldest_buffered_at
-                    .map(|t| t.elapsed() >= self.cfg.rotate_interval_max)
-                    .unwrap_or(false)
-        };
-        if aged {
-            self.rotate().await?;
-        }
-        Ok(())
     }
 
     /// Refresh `_meta/.../state.json`: advance `resume_offset` when the
@@ -662,8 +1095,10 @@ impl WriterInner {
     /// One staging-GC pass. An object is deleted only when ALL
     /// of these hold:
     ///   1. its serial_seq <= the SERVER group watermark (consumed);
-    ///   2. it is older than `gc_retain_days` (age = now - its epoch, the
-    ///      write-time wall clock embedded in the name);
+    ///   2. it is older than `gc_retain_days` (age = now - the epoch in its
+    ///      name, i.e. the writer session's start; a long session makes
+    ///      consumed files look OLDER than they are, so this only ever
+    ///      reclaims early, never late);
     ///   3. deleting it keeps the directory at >= `gc_retain_min_files`.
     ///
     /// Hard rules: the newest object is never deleted (it feeds the resume
@@ -793,15 +1228,6 @@ fn spawn_gc(inner: &Arc<WriterInner>) {
 /// front; past this the String grows the ordinary way.
 const MAX_CSV_RESERVE: usize = 256 * 1024 * 1024;
 
-/// What one staging pass produced, for threshold calibration.
-struct StageStats {
-    rows: usize,
-    /// Rendered CSV size — what the rotation threshold is calibrated on.
-    bytes: usize,
-    /// Bytes actually put to staging (== bytes when uncompressed).
-    stored_bytes: usize,
-}
-
 /// Compare only what the load path depends on: column order, names and types.
 /// `Field` equality would also compare nullability and metadata, which differ
 /// harmlessly between a delta-rs-produced batch and the schema we read from
@@ -841,6 +1267,11 @@ fn spawn_ticker(inner: &Arc<WriterInner>) {
                     "ticker stopped: writer is fenced");
                 break;
             }
+            if inner.order_fatal.lock().unwrap().is_some() {
+                tracing::warn!(group = %inner.serial_group,
+                    "ticker stopped: staging order violation; buffered rows are not staged");
+                break;
+            }
             // Fatal serial-contract violation: the notifier has stopped
             // submitting for this group and check_health refuses every
             // rotation, so ticking on would log the same failure every period
@@ -851,13 +1282,549 @@ fn spawn_ticker(inner: &Arc<WriterInner>) {
                     "ticker stopped: serial-contract violation; buffered rows are not staged");
                 break;
             }
-            if let Err(e) = inner.rotate_if_aged().await {
+            if let Err(e) = inner.seal_if_aged_nonblocking().await {
                 tracing::warn!(error = %e, group = %inner.serial_group,
                     "age-triggered rotation failed; data stays buffered for the next attempt");
             }
             inner.persist_state_if_due().await;
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// The rotation pipeline: render -> gzip -> put, one task per stage.
+// ---------------------------------------------------------------------------
+
+/// Start the three stage tasks. Each holds a `Weak` to the writer, so a
+/// dropped writer ends them: the seal channel closes when `WriterInner`
+/// drops, the render task exits, and the closure cascades down the chain.
+/// A file whose put is in flight at that moment still lands, and recovery
+/// backfill owns it (the object is on storage, the announcement is not).
+fn spawn_pipeline(
+    inner: &Arc<WriterInner>,
+    rx: mpsc::Receiver<Sealed>,
+    progress: Arc<watch::Sender<Progress>>,
+) {
+    // One slot between stages: with a single task per stage that is exactly
+    // "file N+1 is waiting when the next stage finishes N", which is all the
+    // overlap three stages can use.
+    let (tx_gzip, rx_gzip) = mpsc::channel::<Rendered>(1);
+    let (tx_put, rx_put) = mpsc::channel::<Compressed>(1);
+    tokio::spawn(render_stage(
+        Arc::downgrade(inner),
+        rx,
+        tx_gzip,
+        progress.clone(),
+    ));
+    tokio::spawn(gzip_stage(
+        Arc::downgrade(inner),
+        rx_gzip,
+        tx_put,
+        progress.clone(),
+    ));
+    tokio::spawn(put_stage(Arc::downgrade(inner), rx_put, progress));
+}
+
+/// Stage 1: dedup + CSV on the blocking pool. A render failure is
+/// deterministic (a row the formatter rejects), so it is reported as
+/// permanent -- `flush` sees it at once -- but the file is still retried at
+/// the capped backoff rather than skipped: skipping would drop rows and
+/// leave a seq hole `flush` could never wait out.
+async fn render_stage(
+    weak: Weak<WriterInner>,
+    mut rx: mpsc::Receiver<Sealed>,
+    tx: mpsc::Sender<Rendered>,
+    progress: Arc<watch::Sender<Progress>>,
+) {
+    while let Some(Sealed { mut meta, batches }) = rx.recv().await {
+        meta.queue_ms = ms(meta.sealed_at.elapsed());
+        // Shared, not moved: a retry needs the batches again.
+        let batches = Arc::new(batches);
+        let mut attempt = 0u32;
+        let (body, rows) = loop {
+            let Some(inner) = weak.upgrade() else { return };
+            if fenced_exit(&inner, "render", &meta) {
+                return;
+            }
+            let started = Instant::now();
+            match render_once(&inner, batches.clone()).await {
+                Ok(out) => {
+                    meta.render_ms = ms(started.elapsed());
+                    if attempt > 0 {
+                        clear_failure(&progress, meta.serial_seq);
+                    }
+                    break out;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    report_failure(&progress, &meta, "render", attempt, true, &e);
+                    drop(inner);
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+            }
+        };
+        // The arrow batches are dead weight from here on; release them
+        // before waiting for the gzip stage to take the body.
+        drop(batches);
+        // Calibrate the size threshold on the measured row width right
+        // away, not after the upload: the buffer refilling meanwhile is
+        // judged against it.
+        if rows > 0 {
+            if let Some(inner) = weak.upgrade() {
+                inner.state.lock().await.avg_row_bytes = Some(body.len() as f64 / rows as f64);
+            }
+        }
+        if tx
+            .send(Rendered {
+                meta,
+                body: Arc::new(body),
+                rows,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// One render attempt: gather what the blocking closure needs, run it off
+/// the runtime.
+async fn render_once(
+    inner: &WriterInner,
+    batches: Arc<Vec<RecordBatch>>,
+) -> Result<(String, usize)> {
+    let pk = if inner.cfg.stream_mode == StreamMode::Upsert {
+        Some(inner.schema.pk_indices()?)
+    } else {
+        None
+    };
+    let names: Vec<String> = inner
+        .schema
+        .arrow
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let delimiter = inner.cfg.csv.delimiter;
+    let avg_row_bytes = inner.state.lock().await.avg_row_bytes;
+    tokio::task::spawn_blocking(move || {
+        render(&batches, pk.as_deref(), &names, delimiter, avg_row_bytes)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("render task failed: {e}")))?
+}
+
+/// Dedup + serialize. Returns the CSV body and the surviving row count.
+/// `avg_row_bytes` is the previous file's measurement (None for the first)
+/// and only sizes the output buffer up front.
+fn render(
+    batches: &[RecordBatch],
+    pk: Option<&[usize]>,
+    names: &[String],
+    delimiter: char,
+    avg_row_bytes: Option<f64>,
+) -> Result<(String, usize)> {
+    // 1. Intra-file PK dedup, last write wins (hard requirement in upsert
+    //    mode); insert-only keeps every row.
+    let keep: Vec<Vec<usize>> = match pk {
+        Some(pk) => dedup_last_wins(batches, pk)?,
+        None => batches
+            .iter()
+            .map(|b| (0..b.num_rows()).collect())
+            .collect(),
+    };
+
+    // 2. Serialize to CSV (header always on).
+    let fmt = CsvFormatter::new(delimiter);
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut body = fmt.header(&name_refs);
+    // Reserve the whole file up front from the measured average: without
+    // it a 64MB body grows through ~20 reallocation + copy rounds.
+    {
+        let rows_total: usize = keep.iter().map(|r| r.len()).sum();
+        let per_row = avg_row_bytes.unwrap_or(128.0).max(1.0);
+        let est = (rows_total as f64 * per_row) as usize;
+        body.reserve(est.min(MAX_CSV_RESERVE));
+    }
+    let mut kept_rows = 0usize;
+    for (b, rows) in batches.iter().zip(keep.iter()) {
+        kept_rows += rows.len();
+        fmt.format_rows(b, rows, &mut body)?;
+    }
+    Ok((body, kept_rows))
+}
+
+/// Stage 2: gzip on the blocking pool (or a pass-through for plain staging).
+async fn gzip_stage(
+    weak: Weak<WriterInner>,
+    mut rx: mpsc::Receiver<Rendered>,
+    tx: mpsc::Sender<Compressed>,
+    progress: Arc<watch::Sender<Progress>>,
+) {
+    while let Some(Rendered {
+        mut meta,
+        body,
+        rows,
+    }) = rx.recv().await
+    {
+        let bytes = body.len();
+        let payload: Vec<u8> = if meta.file.compressed {
+            let mut attempt = 0u32;
+            let compressed = loop {
+                let Some(inner) = weak.upgrade() else { return };
+                if fenced_exit(&inner, "gzip", &meta) {
+                    return;
+                }
+                drop(inner);
+                let started = Instant::now();
+                let body = body.clone();
+                let out = tokio::task::spawn_blocking(move || gzip(&body))
+                    .await
+                    .map_err(|e| Error::Config(format!("gzip task failed: {e}")))
+                    .and_then(|r| r);
+                match out {
+                    Ok(v) => {
+                        meta.gzip_ms = ms(started.elapsed());
+                        if attempt > 0 {
+                            clear_failure(&progress, meta.serial_seq);
+                        }
+                        break v;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        report_failure(&progress, &meta, "gzip", attempt, true, &e);
+                        tokio::time::sleep(backoff(attempt)).await;
+                    }
+                }
+            };
+            // The uncompressed CSV is dead weight from here on; release it
+            // before waiting for the put stage to take the payload, or a
+            // slow upload holds a file's worth of memory twice.
+            drop(body);
+            compressed
+        } else {
+            // Plain: the body IS the payload. Nothing else holds the Arc by
+            // now, so this is a move, not a copy.
+            Arc::try_unwrap(body)
+                .map(String::into_bytes)
+                .unwrap_or_else(|b| b.as_bytes().to_vec())
+        };
+        let stored_bytes = payload.len();
+        if tx
+            .send(Compressed {
+                meta,
+                payload: opendal::Buffer::from(payload),
+                rows,
+                bytes,
+                stored_bytes,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// gzip at level 6 (the default): the bandwidth/CPU sweet spot for CSV. The
+/// backend is zlib-rs (see Cargo.toml), which is where most of a file's CPU
+/// goes. The server sniffs the magic bytes, so no load option is needed.
+fn gzip(body: &str) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(body.len() / 4),
+        flate2::Compression::default(),
+    );
+    enc.write_all(body.as_bytes())
+        .and_then(|_| enc.finish())
+        .map_err(|e| Error::Config(format!("gzip of staged CSV failed: {e}")))
+}
+
+/// Stage 3: the put, then -- the file being durable -- offset, log, notify,
+/// progress. Storage errors are transient by assumption and retried with
+/// backoff for as long as the writer lives; `flush` reports them through
+/// [`Error::StagingStalled`] after `staging_error_after_attempts`.
+async fn put_stage(
+    weak: Weak<WriterInner>,
+    mut rx: mpsc::Receiver<Compressed>,
+    progress: Arc<watch::Sender<Progress>>,
+) {
+    // (epoch_ms, seq, end_offset) of the last file this stage made durable.
+    let mut prev: Option<(u64, u32, i64)> = None;
+    while let Some(Compressed {
+        meta,
+        payload,
+        rows,
+        bytes,
+        stored_bytes,
+    }) = rx.recv().await
+    {
+        {
+            let Some(inner) = weak.upgrade() else { return };
+            if fenced_exit(&inner, "put", &meta) {
+                return;
+            }
+            // The tripwire sits here, right before the first externally
+            // visible side effect, so an ordering bug anywhere upstream is
+            // caught before it can reach storage or the server.
+            if let Err(detail) = check_order(prev, &meta.file) {
+                inner.trip_order_fatal(detail);
+                return;
+            }
+        }
+        let mut attempt = 0u32;
+        let put_ms = loop {
+            // Re-checked per attempt: a writer dropped during a storage
+            // outage must not be kept alive by its own retries, and a fenced
+            // one must not keep uploading under the old epoch.
+            let Some(inner) = weak.upgrade() else { return };
+            if fenced_exit(&inner, "put", &meta) {
+                return;
+            }
+            let started = Instant::now();
+            match put_once(&inner, &meta.object_key, payload.clone()).await {
+                Ok(()) => {
+                    if attempt > 0 {
+                        clear_failure(&progress, meta.serial_seq);
+                    }
+                    break ms(started.elapsed());
+                }
+                Err(e) => {
+                    attempt += 1;
+                    report_failure(&progress, &meta, "put", attempt, false, &e);
+                    drop(inner);
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+            }
+        };
+        // Gone or fenced between the put and here: the object is on storage
+        // under the old epoch and the new holder's recovery listing owns it;
+        // this writer must neither record nor announce it.
+        let Some(inner) = weak.upgrade() else { return };
+        if fenced_exit(&inner, "put (landed)", &meta) {
+            return;
+        }
+        inner
+            .record_durable(&meta, rows, bytes, stored_bytes, put_ms)
+            .await;
+        prev = Some((meta.file.epoch_ms, meta.file.seq, meta.file.end_offset));
+        land(&progress, meta.serial_seq);
+    }
+}
+
+/// One put with the managed-staging credential dance: a denied upload under
+/// Relyt-managed staging is most likely a key the master has since rotated,
+/// so refresh once and retry once only if that produced a different key.
+/// Anything else propagates to the stage's retry loop.
+async fn put_once(inner: &WriterInner, key: &str, payload: opendal::Buffer) -> Result<()> {
+    if let Err(e) = inner.store().put(key, payload.clone()).await {
+        let denied =
+            matches!(&e, Error::Storage(s) if s.kind() == opendal::ErrorKind::PermissionDenied);
+        if !(denied
+            && crate::client::refresh_managed_staging(&inner.staging, "upload denied").await?)
+        {
+            return Err(e);
+        }
+        inner.store().put(key, payload).await?;
+    }
+    Ok(())
+}
+
+/// A copy of `err` that can be stored and handed to more than one waiter.
+/// `Error` is not `Clone` (the storage and database variants wrap types that
+/// are not), so the variants a rotation stage can actually produce are
+/// reproduced and anything else keeps its rendered text.
+fn clone_error(err: &Error) -> Error {
+    match err {
+        Error::Schema(m) => Error::Schema(m.clone()),
+        Error::UnsupportedType { column, data_type } => Error::UnsupportedType {
+            column: column.clone(),
+            data_type: data_type.clone(),
+        },
+        Error::Naming(m) => Error::Naming(m.clone()),
+        Error::Config(m) => Error::Config(m.clone()),
+        other => Error::Config(other.to_string()),
+    }
+}
+
+/// Retry pacing for a failing stage: 1s, 2s, 4s, 8s, 16s, then 30s.
+fn backoff(attempt: u32) -> Duration {
+    let secs = 1u64 << attempt.saturating_sub(1).min(5);
+    Duration::from_secs(secs.min(30))
+}
+
+/// A file is durable: publish it, and clear a stage failure it has caught
+/// up with.
+///
+/// Only a stage failure. A terminal state (fenced, pipeline gone, order
+/// tripped) carries seq `i64::MIN` and would match any comparison, but it is
+/// exactly what a parked `flush` is waiting to be woken by -- clearing it
+/// would leave that `flush` with nothing to wake it, since the writer holds
+/// a progress sender of its own and the channel never closes. A fence
+/// landing while the put stage was inside `record_durable` is that window.
+fn land(progress: &watch::Sender<Progress>, seq: i64) {
+    progress.send_modify(|p| {
+        p.durable_seq = Some(seq);
+        if p.failing
+            .as_ref()
+            .is_some_and(|f| f.kind == FailKind::Stage && f.seq <= seq)
+        {
+            p.failing = None;
+        }
+    });
+}
+
+/// A stage failed on `meta`: log it and let `flush`/`close` see it.
+fn report_failure(
+    progress: &watch::Sender<Progress>,
+    meta: &FileMeta,
+    stage: &'static str,
+    attempt: u32,
+    permanent: bool,
+    err: &Error,
+) {
+    tracing::warn!(
+        stage,
+        serial_seq = meta.serial_seq,
+        attempt,
+        permanent,
+        error = %err,
+        "rotation stage failed; the same file will be retried"
+    );
+    let last = format!("{stage}: {err}");
+    progress.send_if_modified(|p| {
+        match &p.failing {
+            // A terminal state (fenced, pipeline gone) is never overwritten.
+            Some(f) if f.kind != FailKind::Stage => return false,
+            // The slot reports the HEAD of the pipeline: a later file
+            // failing behind a stuck earlier one must not hide the earlier
+            // one from a flush waiting on it. Same seq updates in place.
+            Some(f) if f.seq < meta.serial_seq => return false,
+            _ => {}
+        }
+        p.failing = Some(Failing {
+            seq: meta.serial_seq,
+            stage,
+            attempts: attempt,
+            permanent,
+            // Only a permanent failure carries its cause: a transient one is
+            // reported as StagingStalled, whose contract is "keep waiting".
+            cause: permanent.then(|| Arc::new(clone_error(err))),
+            kind: FailKind::Stage,
+            last,
+        });
+        true
+    });
+}
+
+/// The file that was failing got past its stage.
+fn clear_failure(progress: &watch::Sender<Progress>, seq: i64) {
+    progress.send_if_modified(|p| match &p.failing {
+        Some(f) if f.seq == seq => {
+            p.failing = None;
+            true
+        }
+        _ => false,
+    });
+}
+
+/// A fenced writer was preempted: whatever it still holds in the pipeline
+/// belongs to an epoch the new holder has moved past. Uploading or
+/// announcing it would race the successor (and, insert-only, duplicate its
+/// replay), so the stage drops the file and stops; the new holder's recovery
+/// listing owns anything that already landed.
+fn fenced_exit(inner: &WriterInner, stage: &str, meta: &FileMeta) -> bool {
+    if !inner.is_fenced() {
+        return false;
+    }
+    tracing::warn!(
+        stage,
+        serial_seq = meta.serial_seq,
+        group = %inner.serial_group,
+        "writer is fenced: dropping the in-flight file and stopping this stage"
+    );
+    // Wake anyone waiting in flush/close on this or a later file: the
+    // pipeline will not deliver it. Guarded: an order violation that fired
+    // first must keep the slot -- it needs a human to rewind offsets, a
+    // fence does not, and the error a waiter gets decides which they do.
+    let reason = inner
+        .fenced
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "writer was fenced".into());
+    publish_terminal(&inner.pipeline.progress_tx, FailKind::Fenced, reason);
+    true
+}
+
+/// The order tripwire, evaluated in the put stage right before the first
+/// externally visible side effect. `prev` is the last file this pipeline
+/// made durable, as (epoch_ms, seq, end_offset); None for the first.
+///
+/// One check, on SDK-internal state only: `(epoch, seq)` must be
+/// CONTIGUOUS. Seqs are the dense sequence `seal` allocates under the state
+/// lock, and in steady state no sealed file is ever dropped -- a failed put
+/// retries the same bytes indefinitely, and the only early exits (a fenced
+/// writer, a dead pipeline, this tripwire) end the stage rather than skip
+/// ahead -- so a gap means a file was lost or overtaken. Anyone adding a
+/// "skip this file on failure" rule must revisit this. Kafka offsets are
+/// NOT judged here: they are caller input, validated synchronously in
+/// `append` (they must move forward within a writer), so a rewound consumer
+/// gets an error on that call instead of a poisoned writer; they only
+/// appear in the message below to name the gap.
+///
+/// Correctly built, this never fires; it exists because the failure it
+/// guards is silent -- an out-of-order file is swallowed by the server's
+/// watermark gate as an already-consumed replay while `flush` returns Ok.
+fn check_order(
+    prev: Option<(u64, u32, i64)>,
+    next: &StagedFile,
+) -> std::result::Result<(), String> {
+    let Some((epoch, seq, end)) = prev else {
+        return Ok(());
+    };
+    let seq_ok = if next.epoch_ms == epoch {
+        next.seq == seq.wrapping_add(1)
+    } else {
+        next.epoch_ms > epoch && next.seq == 0
+    };
+    if seq_ok {
+        return Ok(());
+    }
+    let why = if next.epoch_ms == epoch && next.seq > seq + 1 {
+        format!(
+            "seqs {}..={} of epoch {epoch} never arrived",
+            seq + 1,
+            next.seq - 1
+        )
+    } else {
+        format!(
+            "expected seq {} of epoch {epoch} (or seq 0 of a later epoch)",
+            seq + 1
+        )
+    };
+    let gap = if next.start_offset > end + 1 {
+        format!(
+            "; Kafka offsets {}..={} are not in staging",
+            end + 1,
+            next.start_offset - 1
+        )
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "file epoch {} seq {} (Kafka offsets [{}, {}]) reached the upload stage after epoch \
+         {epoch} seq {seq} (offsets up to {end}): {}{gap}. A restart resumes after the \
+         highest staged offset and will NOT re-stage that gap. Stop consuming this stream, \
+         do not commit its Kafka offsets, roll back or upgrade the SDK, then rewind the \
+         consumer to the start of the gap (GUIDE.md, 错误处理).",
+        next.epoch_ms, next.seq, next.start_offset, next.end_offset, why
+    ))
+}
+
+fn ms(d: Duration) -> u64 {
+    d.as_millis() as u64
 }
 
 #[cfg(test)]
@@ -875,10 +1842,18 @@ mod tests {
     /// A writer wired to a staging store that is never reached: every test
     /// below fails before any IO.
     fn test_writer() -> TableWriter {
+        writer_with("id", 3, ClientConfig::DEFAULT_ROTATE_SIZE)
+    }
+
+    /// Same wiring with a chosen primary-key column, queue depth and size
+    /// threshold. A pk that is not a column makes the render stage fail for
+    /// good, which stalls the pipeline without touching the network; a
+    /// threshold of 1 makes every append seal its own file.
+    fn writer_with(pk: &str, depth: usize, rotate_size: u64) -> TableWriter {
         let arrow = StdArc::new(schema(vec![Field::new("id", DataType::Int64, false)]));
         let table_schema = TableSchema {
             arrow: arrow.clone(),
-            pk: vec!["id".to_string()],
+            pk: vec![pk.to_string()],
             db_oid: 13727,
             rel_oid: 54321,
         };
@@ -891,10 +1866,12 @@ mod tests {
             service: StagingService::Oss,
             region: None,
         };
-        let cfg = ClientConfig::with_customer_staging(
+        let mut cfg = ClientConfig::with_customer_staging(
             staging_cfg.clone(),
             "host=127.0.0.1 port=1 user=nobody dbname=nobody",
         );
+        cfg.rotation_queue_depth = depth;
+        cfg.rotate_size_bytes = rotate_size;
         let staging =
             Arc::new(StagingHandle::new(staging_cfg, None).expect("build staging handle"));
         let notifier = Arc::new(Notifier::spawn(cfg.control_dsn.clone(), staging.clone()));
@@ -933,6 +1910,535 @@ mod tests {
         assert!(w.append(b.clone(), 9, 3).await.is_err());
         // Sane range is accepted (buffered, no IO yet).
         assert!(w.append(b, 0, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flush_with_nothing_buffered_returns_at_once() {
+        // Nothing sealed, nothing to wait for: flush must not touch the
+        // pipeline (whose store is unreachable here).
+        let w = test_writer();
+        assert_eq!(w.flush().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn seal_cuts_the_whole_buffer_under_increasing_seqs() {
+        let w = test_writer();
+        let b = one_row(w.schema());
+        w.append(b.clone(), 0, 3).await.unwrap();
+        w.append(b.clone(), 4, 7).await.unwrap();
+        let mut st = w.inner.state.lock().await;
+        let first = w
+            .inner
+            .seal(&mut st, false)
+            .unwrap()
+            .expect("two batches are buffered");
+        assert_eq!(
+            (first.meta.file.start_offset, first.meta.file.end_offset),
+            (0, 7)
+        );
+        assert_eq!(first.batches.len(), 2);
+        assert_eq!(first.meta.rows_in, 2);
+        assert!(st.buffered.is_empty());
+        assert_eq!(st.buffered_rows, 0);
+        assert!(st.oldest_buffered_at.is_none());
+        assert_eq!(st.last_sealed_seq, Some(first.meta.serial_seq));
+        // Empty buffer: nothing to seal and no seq consumed.
+        assert!(w.inner.seal(&mut st, false).unwrap().is_none());
+        assert_eq!(st.next_seq, first.meta.file.seq + 1);
+        drop(st);
+
+        w.append(b, 8, 8).await.unwrap();
+        let mut st = w.inner.state.lock().await;
+        // Not aged yet: the ticker's variant leaves the buffer alone; a
+        // full seal takes it under the next seq.
+        assert!(w.inner.seal(&mut st, true).unwrap().is_none());
+        let second = w.inner.seal(&mut st, false).unwrap().unwrap();
+        assert_eq!(second.meta.file.seq, first.meta.file.seq + 1);
+        assert!(second.meta.serial_seq > first.meta.serial_seq);
+        assert_eq!(
+            (second.meta.file.start_offset, second.meta.file.end_offset),
+            (8, 8)
+        );
+    }
+
+    /// Review finding on the first cut: flush took the same blocking
+    /// hand-over path as append, so once a storage outage had filled the
+    /// queue it could never reach the code that reports the failure.
+    #[tokio::test]
+    async fn flush_reports_a_stalled_pipeline_even_with_a_full_queue() {
+        let w = writer_with("missing", 1, ClientConfig::DEFAULT_ROTATE_SIZE);
+        let b = one_row(w.schema());
+        w.append(b.clone(), 0, 0).await.unwrap();
+        // File 1 is sealed; the render stage fails for good and keeps
+        // retrying it. flush must report that, not wait. The failure is
+        // permanent (the pk column does not exist), so it comes back as
+        // RotationFailed rather than the retry-and-wait StagingStalled.
+        let e = tokio::time::timeout(Duration::from_secs(10), w.flush())
+            .await
+            .expect("flush returns")
+            .unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+        // Fill the one-slot queue behind the stuck stage through the
+        // append path (pure backpressure, still returns while room exists).
+        w.append(b.clone(), 1, 1).await.unwrap();
+        assert!(w.inner.seal_and_send(false, false).await.unwrap().is_some());
+        assert_eq!(w.inner.pipeline.tx.capacity(), 0);
+        // Now nothing can be handed over. flush must still come back, and
+        // must not have cut the buffer it could not deliver.
+        w.append(b, 2, 2).await.unwrap();
+        let e = tokio::time::timeout(Duration::from_secs(10), w.flush())
+            .await
+            .expect("flush must not hang on a full queue")
+            .unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+        assert_eq!(w.inner.state.lock().await.buffered.len(), 1);
+    }
+
+    /// Review finding on the first cut: the stages checked only that the
+    /// writer still existed, so a preempted writer kept uploading and
+    /// announcing files under the epoch its successor had moved past.
+    #[tokio::test]
+    async fn fenced_writer_stops_its_pipeline() {
+        let w = test_writer();
+        let b = one_row(w.schema());
+        w.append(b, 0, 0).await.unwrap();
+        // Hand a file over, then fence before the render stage has run
+        // (current-thread runtime: it runs only when this task yields).
+        assert!(w.inner.seal_and_send(false, false).await.unwrap().is_some());
+        *w.inner.fenced.lock().unwrap() = Some("preempted in test".into());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The render stage saw the fence, dropped the file and exited, and
+        // told the progress channel so that any waiter wakes with the fence.
+        assert!(w.inner.pipeline.tx.is_closed());
+        assert_eq!(
+            w.inner
+                .pipeline
+                .progress
+                .borrow()
+                .failing
+                .as_ref()
+                .map(|f| f.kind),
+            Some(FailKind::Fenced)
+        );
+        assert!(matches!(
+            w.inner.await_durable(i64::MAX).await,
+            Err(Error::WriterFenced(_))
+        ));
+        // Nothing was staged, and the writer refuses further work.
+        assert_eq!(w.inner.state.lock().await.staged_offset, None);
+        assert!(matches!(w.flush().await, Err(Error::WriterFenced(_))));
+    }
+
+    #[tokio::test]
+    async fn sealed_files_count_as_lag_before_they_are_durable() {
+        let w = writer_with("missing", 1, ClientConfig::DEFAULT_ROTATE_SIZE);
+        let b = one_row(w.schema());
+        w.append(b, 0, 0).await.unwrap();
+        // Buffered rows: the age signal reads from the buffer.
+        assert!(oldest_unstaged_age(&*w.inner.state.lock().await).is_some());
+        let seq = w.inner.seal_and_send(false, false).await.unwrap().unwrap();
+        let st = w.inner.state.lock().await;
+        // Sealed, not durable (the render stage fails for good): the buffer
+        // is empty, yet the file is registered for lag and still ages.
+        assert!(st.buffered.is_empty() && st.oldest_buffered_at.is_none());
+        assert_eq!(st.known_files.last().map(|(s, _)| *s), Some(seq));
+        assert_eq!(st.in_flight.len(), 1);
+        assert!(oldest_unstaged_age(&st).is_some());
+        assert_eq!(lag_of(&mut st.known_files.clone(), None, u64::MAX).0, 1);
+    }
+
+    fn meta(seq: i64) -> FileMeta {
+        FileMeta {
+            file: file(1, seq as u32, 0, 0),
+            serial_seq: seq,
+            identifier: String::new(),
+            object_key: String::new(),
+            rows_in: 0,
+            sealed_at: Instant::now(),
+            queue_ms: 0,
+            render_ms: 0,
+            gzip_ms: 0,
+        }
+    }
+
+    #[test]
+    fn failing_slot_reports_the_head_and_keeps_terminal_states() {
+        let (tx, rx) = watch::channel(Progress::default());
+        let err = Error::Config("x".into());
+        let seq_of = |rx: &watch::Receiver<Progress>| {
+            rx.borrow().failing.as_ref().map(|f| (f.seq, f.attempts))
+        };
+        report_failure(&tx, &meta(7), "render", 1, false, &err);
+        assert_eq!(seq_of(&rx), Some((7, 1)));
+        // The earlier (head) file's failure takes the slot over.
+        report_failure(&tx, &meta(5), "put", 1, false, &err);
+        assert_eq!(seq_of(&rx), Some((5, 1)));
+        // A later file's failure must not hide it.
+        report_failure(&tx, &meta(9), "render", 1, false, &err);
+        assert_eq!(seq_of(&rx), Some((5, 1)));
+        // The same file's next attempt updates in place.
+        report_failure(&tx, &meta(5), "put", 2, false, &err);
+        assert_eq!(seq_of(&rx), Some((5, 2)));
+        // Clearing only that file frees the slot; a later one can then report.
+        clear_failure(&tx, 5);
+        assert_eq!(seq_of(&rx), None);
+        report_failure(&tx, &meta(9), "render", 1, false, &err);
+        assert_eq!(seq_of(&rx), Some((9, 1)));
+        // Terminal states win over any stage failure.
+        tx.send_modify(|p| {
+            p.failing = Some(Failing {
+                seq: i64::MIN,
+                stage: "pipeline",
+                attempts: 0,
+                permanent: true,
+                cause: None,
+                kind: FailKind::Fenced,
+                last: "fenced".into(),
+            })
+        });
+        report_failure(&tx, &meta(3), "put", 1, false, &err);
+        assert_eq!(
+            rx.borrow().failing.as_ref().map(|f| f.kind),
+            Some(FailKind::Fenced)
+        );
+    }
+
+    fn file(epoch_ms: u64, seq: u32, start: i64, end: i64) -> StagedFile {
+        StagedFile {
+            epoch_ms,
+            seq,
+            start_offset: start,
+            end_offset: end,
+            compressed: true,
+        }
+    }
+
+    #[test]
+    fn order_tripwire_accepts_contiguous_seqs_and_monotonic_offsets() {
+        assert!(check_order(None, &file(5, 7, 100, 110)).is_ok());
+        assert!(check_order(Some((5, 7, 110)), &file(5, 8, 111, 120)).is_ok());
+        // Offset holes are legitimate (transaction markers, compaction).
+        assert!(check_order(Some((5, 7, 110)), &file(5, 8, 500, 520)).is_ok());
+        // Epoch rollover: a later epoch restarts at seq 0.
+        assert!(check_order(Some((5, MAX_SEQ, 110)), &file(6, 0, 111, 111)).is_ok());
+    }
+
+    #[test]
+    fn order_tripwire_rejects_gaps_overtakes_and_offset_regressions() {
+        // A lost file: seq 8 never made it.
+        let e = check_order(Some((5, 7, 110)), &file(5, 9, 130, 140)).unwrap_err();
+        assert!(e.contains("seqs 8..=8 of epoch 5 never arrived"), "{e}");
+        assert!(e.contains("offsets 111..=129 are not in staging"), "{e}");
+        // Overtaken: an older file arrives after a newer one.
+        assert!(check_order(Some((5, 8, 120)), &file(5, 7, 100, 110)).is_err());
+        // Same seq twice.
+        assert!(check_order(Some((5, 7, 110)), &file(5, 7, 111, 120)).is_err());
+        // Epoch rollover must start at 0.
+        assert!(check_order(Some((5, 7, 110)), &file(6, 1, 111, 120)).is_err());
+        // Offsets are not the tripwire's business (append validates them).
+        assert!(check_order(Some((5, 7, 110)), &file(5, 8, 105, 120)).is_ok());
+    }
+
+    /// Review finding on the second cut: the pipeline never woke a waiting
+    /// flush when the tripwire fired, and close() skipped the health gate.
+    #[tokio::test]
+    async fn order_violation_wakes_waiters_and_fails_flush_and_close() {
+        let w = test_writer();
+        w.inner.trip_order_fatal("gap in test".into());
+        assert!(matches!(
+            w.inner.await_durable(i64::MAX).await,
+            Err(Error::StagingOrderViolation(_))
+        ));
+        assert!(matches!(
+            w.flush().await,
+            Err(Error::StagingOrderViolation(_))
+        ));
+        assert!(matches!(
+            w.close().await,
+            Err(Error::StagingOrderViolation(_))
+        ));
+    }
+
+    /// Review finding on the second cut: append parked forever on a full
+    /// queue behind a stuck pipeline, so the usual append*N -> flush loop
+    /// never reached the flush that reports the stall.
+    #[tokio::test]
+    async fn append_reports_a_stalled_pipeline_without_taking_the_batch() {
+        let w = writer_with("missing", 1, 1);
+        let b = one_row(w.schema());
+        // Every append seals its own file. Yield after each so the render
+        // stage (current-thread runtime: it runs only when this task yields)
+        // has taken file 1 and reported its permanent failure before file 2
+        // arrives; file 2 then fills the one-slot queue.
+        w.append(b.clone(), 0, 0).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        w.append(b.clone(), 1, 1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let e = tokio::time::timeout(Duration::from_secs(10), w.append(b.clone(), 2, 2))
+            .await
+            .expect("append must not park on a stalled pipeline")
+            .unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+        // Not accepted: the batch is not in the buffer, and the offset
+        // high-water mark rolled back so the same batch can be retried.
+        {
+            let st = w.inner.state.lock().await;
+            assert!(st.buffered.is_empty());
+            assert_eq!(st.max_end_offset, Some(1));
+        }
+        let e = w.append(b, 2, 2).await.unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+    }
+
+    /// Review finding on the second cut: offsets are caller input, so a
+    /// rewound consumer gets a synchronous error, not a poisoned writer.
+    #[tokio::test]
+    async fn append_rejects_offsets_going_backwards() {
+        let w = test_writer();
+        let b = one_row(w.schema());
+        w.append(b.clone(), 0, 5).await.unwrap();
+        let same_end = w.append(b.clone(), 5, 6).await.unwrap_err();
+        assert!(matches!(same_end, Error::Config(_)), "{same_end}");
+        let earlier = w.append(b.clone(), 3, 4).await.unwrap_err();
+        assert!(matches!(earlier, Error::Config(_)), "{earlier}");
+        // The writer is still usable; only the batch was refused.
+        w.append(b, 6, 6).await.unwrap();
+        assert_eq!(w.inner.state.lock().await.buffered.len(), 2);
+    }
+
+    /// Review finding on the sixth round: a permanent stage failure was
+    /// reported as StagingStalled, whose documented remedy is "keep
+    /// flushing" -- an endless loop for something retrying cannot fix.
+    #[test]
+    fn permanent_and_transient_stage_failures_map_to_different_errors() {
+        let (tx, rx) = watch::channel(Progress::default());
+        let cfg = ClientConfig::new("host=127.0.0.1 port=1 user=n dbname=n");
+        let attempts = cfg.staging_error_after_attempts;
+
+        // Transient: still "wait, it may clear".
+        report_failure(
+            &tx,
+            &meta(1),
+            "put",
+            attempts,
+            false,
+            &Error::Config("net".into()),
+        );
+        let f = rx.borrow().failing.clone().unwrap();
+        assert!(matches!(terminal_error(&f), Error::StagingStalled { .. }));
+
+        // Permanent: names the stage and carries the cause through.
+        clear_failure(&tx, 1);
+        report_failure(
+            &tx,
+            &meta(2),
+            "render",
+            1,
+            true,
+            &Error::Schema("column type Float64 cannot be part of a primary key".into()),
+        );
+        let f = rx.borrow().failing.clone().unwrap();
+        match terminal_error(&f) {
+            Error::RotationFailed { stage, source } => {
+                assert_eq!(stage, "render");
+                assert!(source.to_string().contains("primary key"), "{source}");
+            }
+            other => panic!("expected RotationFailed, got {other}"),
+        }
+    }
+
+    /// Review finding on the sixth round: a float primary key passed
+    /// open_table and then failed forever inside the pipeline, where the
+    /// rows are already sealed and the error cannot be acted on. The
+    /// seventh round narrowed it: only floats, and only for upsert.
+    #[test]
+    fn float_primary_keys_are_refused_for_upsert_only() {
+        let with_key = |dt: DataType| TableSchema {
+            arrow: StdArc::new(schema(vec![Field::new("id", dt, false)])),
+            pk: vec!["id".into()],
+            db_oid: 1,
+            rel_oid: 2,
+        };
+
+        // Every supported column type can be a key, binary included ...
+        for ok in [
+            DataType::Int64,
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::Boolean,
+            DataType::Date32,
+            DataType::Decimal128(18, 5),
+        ] {
+            let s = with_key(ok.clone());
+            assert!(s.validate().is_ok(), "{ok:?}");
+            assert!(s.validate_pk_for_dedup().is_ok(), "{ok:?}");
+        }
+
+        // ... except floats, whose equality does not agree across the two
+        // sides. The column type itself stays supported.
+        for bad in [DataType::Float64, DataType::Float32] {
+            let s = with_key(bad.clone());
+            assert!(crate::csv::is_supported_type(&bad), "{bad:?}");
+            // The generic check stays silent: insert-only never dedups, so
+            // such a table must keep working there.
+            assert!(s.validate().is_ok(), "{bad:?}");
+            let e = s.validate_pk_for_dedup().unwrap_err();
+            assert!(
+                matches!(&e, Error::UnsupportedType { data_type, .. } if data_type.contains("upsert")),
+                "{bad:?}: {e}"
+            );
+        }
+    }
+
+    /// Review finding on the fifth round: known_files carried the session
+    /// epoch, so lag_seconds read "time since open", not file age.
+    #[tokio::test]
+    async fn sealed_files_are_stamped_with_their_own_time_not_the_epoch() {
+        let w = test_writer(); // initial_epoch_ms is 1 in this fixture
+        let b = one_row(w.schema());
+        w.append(b, 0, 0).await.unwrap();
+        let before = crate::lock::now_ms();
+        let seq = w.inner.seal_and_send(false, false).await.unwrap().unwrap();
+        let st = w.inner.state.lock().await;
+        let (s, stamped) = *st.known_files.last().unwrap();
+        assert_eq!(s, seq);
+        assert!(
+            stamped >= before && stamped <= crate::lock::now_ms(),
+            "{stamped}"
+        );
+        // Would have been ~1 with the epoch, i.e. decades of "lag".
+        assert!(stamped > 1_000_000_000_000);
+    }
+
+    /// Review finding on the fifth round: a fence landing after the order
+    /// tripwire overwrote its terminal state and check_health hid it.
+    #[tokio::test]
+    async fn order_violation_survives_a_later_fence() {
+        let w = test_writer();
+        w.inner.trip_order_fatal("gap".into());
+        *w.inner.fenced.lock().unwrap() = Some("preempted".into());
+        // The stage-side exit must keep the earlier terminal state ...
+        assert!(fenced_exit(&w.inner, "put", &meta(1)));
+        assert_eq!(
+            w.inner
+                .pipeline
+                .progress
+                .borrow()
+                .failing
+                .as_ref()
+                .map(|f| f.kind),
+            Some(FailKind::OrderViolation)
+        );
+        // ... and so must the foreground gate.
+        assert!(matches!(
+            w.inner.check_health(),
+            Err(Error::StagingOrderViolation(_))
+        ));
+        assert!(matches!(
+            w.inner.await_durable(i64::MAX).await,
+            Err(Error::StagingOrderViolation(_))
+        ));
+    }
+
+    /// Review finding on the third cut: `unbuffer` rolled the offset
+    /// high-water mark back even when a concurrent sealer had already taken
+    /// the batch, so `append` reported "not accepted" for a batch that was
+    /// in the pipeline and the caller would have appended it twice.
+    #[tokio::test]
+    async fn unbuffer_only_rolls_back_the_batch_it_takes() {
+        let w = test_writer();
+        let b = one_row(w.schema());
+        w.append(b.clone(), 0, 5).await.unwrap();
+        w.append(b, 6, 9).await.unwrap();
+        // The batch is still buffered: taken back, water mark restored.
+        assert!(w.inner.unbuffer(6, 9, Some(5)).await);
+        {
+            let st = w.inner.state.lock().await;
+            assert_eq!(st.buffered.len(), 1);
+            assert_eq!(st.max_end_offset, Some(5));
+            assert_eq!(st.buffered_rows, 1);
+        }
+        // Someone else sealed it meanwhile: nothing to take back, and the
+        // water mark must not move (it would let the caller re-append).
+        assert!(!w.inner.unbuffer(10, 12, Some(5)).await);
+        assert_eq!(w.inner.state.lock().await.max_end_offset, Some(5));
+    }
+
+    /// Review finding on the third cut: a file landing cleared any failing
+    /// entry at or below its seq, and terminal states carry i64::MIN, so a
+    /// fence that landed during `record_durable` was wiped and the flush it
+    /// should have woken parked forever.
+    #[tokio::test]
+    async fn a_landed_file_clears_stage_failures_but_not_terminal_states() {
+        let w = test_writer();
+        let tx = &w.inner.pipeline.progress_tx;
+        let kind = || {
+            w.inner
+                .pipeline
+                .progress
+                .borrow()
+                .failing
+                .as_ref()
+                .map(|f| f.kind)
+        };
+
+        report_failure(tx, &meta(5), "put", 1, false, &Error::Config("x".into()));
+        land(tx, 5);
+        assert_eq!(kind(), None, "the stage failure is caught up with");
+
+        for terminal in [
+            FailKind::Fenced,
+            FailKind::PipelineGone,
+            FailKind::OrderViolation,
+        ] {
+            tx.send_modify(|p| {
+                p.failing = Some(Failing {
+                    seq: i64::MIN,
+                    stage: "pipeline",
+                    attempts: 0,
+                    permanent: true,
+                    cause: None,
+                    kind: terminal,
+                    last: "terminal".into(),
+                })
+            });
+            land(tx, 9);
+            assert_eq!(
+                kind(),
+                Some(terminal),
+                "{terminal:?} must survive a landing"
+            );
+        }
+    }
+
+    /// Review finding on the second cut: pipeline_gone overwrote a Fenced
+    /// terminal state, turning WriterFenced into WriterClosed.
+    #[tokio::test]
+    async fn pipeline_gone_keeps_an_earlier_terminal_state() {
+        let w = test_writer();
+        w.inner.pipeline.progress_tx.send_modify(|p| {
+            p.failing = Some(Failing {
+                seq: i64::MIN,
+                stage: "pipeline",
+                attempts: 0,
+                permanent: true,
+                cause: None,
+                kind: FailKind::Fenced,
+                last: "preempted".into(),
+            })
+        });
+        assert!(matches!(w.inner.pipeline_gone(), Error::WriterFenced(_)));
+        assert_eq!(
+            w.inner
+                .pipeline
+                .progress
+                .borrow()
+                .failing
+                .as_ref()
+                .map(|f| f.kind),
+            Some(FailKind::Fenced)
+        );
     }
 
     #[tokio::test]
@@ -1166,9 +2672,7 @@ fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
                 (
                     files,
                     secs,
-                    st.oldest_buffered_at
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0),
+                    oldest_unstaged_age(&st).map(|d| d.as_secs()).unwrap_or(0),
                     st.staged_offset,
                     st.buffered_rows,
                 )
@@ -1195,13 +2699,23 @@ fn spawn_lag_monitor(inner: &Arc<WriterInner>) {
     });
 }
 
+/// Age of the oldest row not yet durable on staging: the buffer's oldest
+/// batch or the oldest sealed-but-not-durable file, whichever is older.
+fn oldest_unstaged_age(st: &WriterState) -> Option<Duration> {
+    st.oldest_buffered_at
+        .iter()
+        .chain(st.in_flight.iter().map(|(_, t)| t))
+        .map(|t| t.elapsed())
+        .max()
+}
+
 /// Drop from `known` every file at or below `watermark` (consumed) and
 /// measure what is left: (how many files, age in seconds of the oldest by
-/// its write-time epoch). `None` means the server has consumed nothing yet,
-/// so everything counts.
+/// the time it was sealed). `None` means the server has consumed nothing
+/// yet, so everything counts.
 fn lag_of(known: &mut Vec<(i64, u64)>, watermark: Option<i64>, now_ms: u64) -> (usize, u64) {
     known.retain(|(seq, _)| watermark.is_none_or(|w| *seq > w));
-    let oldest = known.iter().map(|(_, epoch)| *epoch).min();
+    let oldest = known.iter().map(|(_, sealed_at_ms)| *sealed_at_ms).min();
     (
         known.len(),
         oldest.map(|e| now_ms.saturating_sub(e) / 1000).unwrap_or(0),

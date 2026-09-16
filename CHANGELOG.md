@@ -16,3 +16,20 @@ minor release may contain breaking changes; each one is called out here.
 - Requires Relyt 3.55.0 or later on the server side.
 - gzip of staged objects uses flate2's zlib-rs backend: 2.6x less CPU per
   file than the default backend at the same level and ratio.
+- Rotation runs in a per-writer background pipeline (render -> gzip -> put,
+  CPU stages on the blocking pool) instead of inside the `append` that trips
+  the threshold: `append` no longer pays the upload, and consecutive files
+  overlap their stages. Files still reach the server in seq order and
+  `flush()` still means durable. New tunables `rotation_queue_depth` (default 3) and
+  `staging_error_after_attempts` (default 3); new error `StagingStalled` (returned by
+  `append`/`flush`/`close` while a file keeps failing to stage -- nothing is
+  dropped, an `append` that gets it did not take its batch, the pipeline
+  retries), `RotationFailed` (the same position in the pipeline but for a
+  failure retrying cannot fix, carrying the cause; waiting is not the
+  remedy) and `StagingOrderViolation` (an order tripwire in
+  the upload stage; a broken SDK invariant, with the Kafka offset range to
+  rewind to in the message). An upsert stream whose primary key is a
+  floating-point column is refused by `open_table` instead of failing
+  inside the pipeline; binary keys are supported. The per-writer memory bound becomes
+  (6 + `rotation_queue_depth`) x `rotate_size_bytes` (was ~2x); size
+  `rotate_size_bytes` down for many writers per process.
