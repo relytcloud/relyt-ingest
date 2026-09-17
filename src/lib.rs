@@ -110,6 +110,7 @@
 //!   that writer's watermark, GC, and queue; the operational SOP (skip +
 //!   resume) lives in GUIDE.md and is exercised by the e2e suite.
 
+mod alarm;
 mod client;
 mod config;
 mod csv;

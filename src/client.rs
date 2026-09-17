@@ -42,6 +42,12 @@ impl Client {
     /// before staging access exists -- the reverse of the customer-owned
     /// order, where both are known from the config.
     pub async fn connect(cfg: ClientConfig) -> Result<Client> {
+        Self::connect_inner(cfg)
+            .await
+            .map_err(|e| crate::error::log_input_error("Client::connect", e))
+    }
+
+    async fn connect_inner(cfg: ClientConfig) -> Result<Client> {
         cfg.validate()?;
         let (control, connection) = connect_control(&cfg.control_dsn).await?;
         tokio::spawn(async move {
@@ -90,6 +96,16 @@ impl Client {
     /// writer and the recovery plan (the caller seeks Kafka to
     /// `plan.kafka_resume_offset` before producing new appends).
     pub async fn open_table(
+        &self,
+        table: &str,
+        writer_id: &str,
+    ) -> Result<(TableWriter, RecoveryPlan)> {
+        self.open_table_inner(table, writer_id)
+            .await
+            .map_err(|e| crate::error::log_input_error("open_table", e))
+    }
+
+    async fn open_table_inner(
         &self,
         table: &str,
         writer_id: &str,

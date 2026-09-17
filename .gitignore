@@ -1,2 +1,19 @@
 /target
 ci/bins/
+
+# Documents and presentations never belong in this repository: it mirrors to
+# a public GitHub repo and to crates.io, and the scrub check cannot read
+# inside a binary file to tell whether it carries anything internal. Keep
+# slides, spreadsheets and exported reports outside the working tree, or add
+# an explicit exception here after deciding the file is publishable.
+*.ppt
+*.pptx
+*.key
+*.xls
+*.xlsx
+*.doc
+*.docx
+*.pdf
+*.odp
+*.ods
+*.odt

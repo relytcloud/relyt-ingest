@@ -288,18 +288,64 @@ CPU 上界 2 核。给容器定规格时注意两点：
 | `staging_compression` | `Gzip` | staged CSV 文件 gzip 压缩后上传（对象名 `.csv.gz`）；Relyt 服务端按文件内容自动识别并解压，**无需任何服务端配置**。设为 `Plain` 得到可直接下载阅读的明文 `.csv`（排障时有用）。攒批阈值始终按压缩前的 CSV 大小判定。取舍：压缩比取决于数据形态（宽字符串表通常是几倍），省下的是上传带宽与 staging 存储；代价主要是**客户端 CPU**——压缩是写入通路里最重的一段。Relyt 侧解压的开销很小，**所以这是客户端 CPU 与带宽/存储之间的取舍，与服务端关系不大** |
 | `cluster_id` | `None` | Relyt 实例标识（instance id——一个 Relyt 实例即一个 DWSU，对应一个 id），用作 staging 路径的命名空间，隔离多个实例共用一个桶的场景。一般不用设：SDK 自动向服务端获取。仅当实例未配置该标识（connect 报错提示时）才需显式指定 |
 
-### 错误处理（消费循环里必须处理的几类）
+### 错误处理
 
-| 错误 | 含义 | 正确动作 |
+先按"要不要停"分四类。**所有错误都从 `connect` / `open_table` / `append` / `flush` /
+`close` 直接返回**，不需要回调或轮询就能拿到；停流态另有两条通道，见 A。
+
+#### A. 流已停止 —— 必须停止该流的消费
+
+这四种不会自愈。SDK 侧该流已停写，`append` / `flush` / `close` 从此全部返回同一个错误。
+
+| 错误 | 含义 | 动作 |
 |---|---|---|
-| `StagingStalled`（`append`/`flush`/`close` 返回） | staging 持续不可达：流水线队头文件连续失败 `staging_error_after_attempts` 次。**已切出的行仍在内存里**，流水线继续按 1s→30s 退避重试同一份字节。队列满时 `append` 先阻塞（背压），达到阈值后也返回它——**这一批数据未被接收** | `append` 收到：稍后重试同一批。`flush` 收到：**稍后继续 `flush`**，不要重开 writer。期间都不要提交对应的 Kafka offset |
-| `RotationFailed`（`append`/`flush`/`close` 返回） | 已切出的文件在渲染/压缩/上传的某一步反复失败，且重试不会好（错误信息带出具体原因）。与 `StagingStalled` 的区别就是"等下去没用" | **不要继续 `flush` 等待**，也不要提交对应的 Kafka offset；按错误信息修掉根因（多为数据或表定义问题）后重启，由恢复握手重放 |
-| `StagingOrderViolation`（`append`/`flush`/`close` 返回） | SDK 内部不变量被破坏：文件没有按 seq 顺序到达上传段。错误信息里带**缺失的 seq 与 Kafka offset 区间** | **停止该流的消费、不要提交 Kafka offset**、上报；回滚或升级 SDK 后按下一节人工回拨位点再启动。**重启不会自愈** |
-| `close()` 返回上面任一错误 | `close(self)` 按值消费 writer：无论返回什么，writer 都已结束，缓冲与在途文件随之丢弃 | **不要提交对应的 Kafka offset**，重启后由恢复握手从 `RecoveryPlan::kafka_resume_offset` 续读即可。想在 writer 还可用时看到并等待流水线恢复，就先调 `flush()` |
-| `append` 返回 `Config`（offset 回退） | 这一批的 `start_offset` ≤ 本 writer 已 append 过的最大 `end_offset`：消费位点被回拨（rebalance、seek）到已 append 的区间。**数据未入缓冲**，writer 仍可用 | 不要对同一 writer 重放：重开该表（`open_table`）并从 `RecoveryPlan::kafka_resume_offset` 续读 |
-| `WriterFenced` / `SerialContractViolation` | 本 writer 已被另一进程接管，或 writer 身份冲突 | 停止本进程该流的消费，排查是否有重复部署 |
-| `open_table` 返回 `WriterLocked` | 该 writer_id 已有活跃进程 | 不要强行启动；确认旧进程已死可等约 3 分钟租约过期自动接管 |
-| 其余错误（网络、控制连接） | SDK 内部已做重试，透出的是可重试故障 | 退避后重开 writer，断点自动恢复 |
+| `WriterFenced` | 租约被另一进程接管 | 停止本进程该流的消费，排查是否重复部署。**不要回拨位点**：持有租约的那个 writer 在继续这条流 |
+| `StagingOrderViolation` | 文件没有按 seq 顺序到达上传段（SDK 内部不变量被破坏）。错误信息带**缺失的 seq 与 Kafka offset 区间** | 停止消费、**不要提交 offset**、上报；回滚或升级 SDK 后**按错误里的区间人工回拨**再启动。重启不会自愈 |
+| `RotationFailed` | 已切出文件的**数据或表定义**被拒绝，重试多少次也渲染不出 CSV | 停止消费、不要提交 offset；按错误信息修掉根因后重启，由恢复握手重放，**无需回拨** |
+| `SerialContractViolation` | 两个 writer 用了同一个 writer_id，或 epoch 回退 | 停止消费，解决身份冲突后再启动 |
+
+同一件事有**三条通道**，按你的架构任选或并用：
+
+1. `append` / `flush` / `close` 的返回值 —— 调用时立刻知道；
+2. `writer.fatal_error()` 返回 `Some(原因)` —— **应用空闲、长时间不调用 `append` 时靠它**，
+   因为租约心跳这类后台任务会先于业务调用发现问题；
+3. 日志里的 `RELYT_OBSERVE_ALARM` 行 —— 供日志告警规则，见下文。
+
+#### B. 集成或配置问题 —— 改完再启动
+
+参数、配置或表定义不满足契约，**重试同样的输入必然同样失败**。SDK 在返回错误的同时打一条
+`ERROR` 日志，以免应用吞掉返回值后无迹可循。
+
+| 错误 | 典型原因 |
+|---|---|
+| `Config` | offset 回退或非法、参数越界、凭证里含逗号或引号 |
+| `Schema` | `append` 传入的数据与表结构不符；upsert 模式但表没有主键 |
+| `UnsupportedType` | 列类型不支持；upsert 的主键是浮点列 |
+| `Naming` | writer_id 非法或过长 |
+
+动作：**当作集成缺陷处理**——不要用同样的输入重试，修正代码、表定义或运维操作后重启。
+其中 `append` 返回 `Config`（offset 回退）是唯一一个由运维动作触发的：消费位点被
+rebalance 或 seek 拨回了已写过的区间，此时**数据未入缓冲、writer 仍可用**，正确动作是重开
+该表（`open_table`）并从 `RecoveryPlan::kafka_resume_offset` 续读。
+
+#### C. 稍后重试 —— 不用停
+
+| 错误 | 含义 | 动作 |
+|---|---|---|
+| `StagingStalled` | staging 持续不可达，流水线仍在按 1s→30s 退避重试同一份字节；`append` 收到它时**这一段数据未被接收** | `append` 收到：稍后重试同一段数据。`flush` 收到：稍后继续 `flush`。都不要重开 writer，期间不要提交对应的 offset |
+| `WriterLocked`（`open_table` 返回） | 该 writer_id 尚有活跃进程；滚动升级时新旧进程交替会短暂出现 | 不要强行启动；确认旧进程已死后，可等约 3 分钟租约过期自动接管 |
+
+#### D. 完全不用处理
+
+上传抖动、通知重试、staging 清理、断点文件写入这些失败，SDK 内部会自行重试，**不会作为
+错误透出**，只在日志里以 `WARN` 出现。消费循环里无需为它们写任何代码。
+
+---
+
+**关于 `close()`**：`close(self)` 按值消费 writer，**无论返回什么 writer 都已结束**，缓冲
+与在途文件随之丢弃。所以收到任何错误时都不要提交对应的 Kafka offset，重启后由恢复握手从
+`RecoveryPlan::kafka_resume_offset` 续读即可；想在 writer 还可用时看到并等待流水线恢复，
+就先调 `flush()`。
 
 ### 什么时候需要人工回拨 Kafka 位点
 
@@ -379,14 +425,75 @@ SDK 用 `tracing` 输出结构化日志（接任意 tracing subscriber 即可采
 | **装载滞后 `lag_seconds`**（SDK 内置）= 最老未装载文件的年龄 | `writer.lag()`（后台每 30s 通过一条常驻连接采样一次服务端水位，与本进程已切出、尚未被水位覆盖的文件清单相减；文件在切出的那一刻即计入——包括尚未上传完成、正在重试上传的文件，所以 staging 不可达时该值与 `buffered_age_seconds` 会一起增长；进程重启后由恢复阶段的目录清单补齐）导出到监控系统；SDK 同时每 ~5 分钟打一行状态心跳日志 | > 120 秒持续 2 个采样 | 服务端装载不畅（含装载失败文件卡队头——此时该值持续增长） |
 | 端到端可见延迟 = now − 表内最新事件时间 | 若表有事件时间列，查询侧探针 `SELECT max(event_time)`（低频，如每分钟） | > 5 × (`rotate_interval_max` + 1 分钟) | 全链路健康的最终裁决，覆盖服务端装载段 |
 
-**必须立即告警的两个状态**（不是滞后，是流已停止，需人工介入）：
+**必须立即告警的状态**（不是滞后，是流已停止，需人工介入）：
 
-- `writer.fatal_error()` 返回 `Some(...)`，或 `append`/`flush` 报
-  `WriterFenced` / `SerialContractViolation`：该流已停写。建议应用内每次
-  append 失败即上报，并在监控面板暴露 `fatal_error()` 状态；
+- **`writer.fatal_error()` 返回 `Some(...)`**：该流已停写，且不会自愈。它覆盖全部四
+  种停流原因——租约被其它进程接管（`WriterFenced`）、内部顺序校验触发
+  （`StagingOrderViolation`）、切文件的某一步永久失败（`RotationFailed`）、writer 身份
+  冲突（`SerialContractViolation`）——返回的字符串就是原因。**建议周期性轮询并暴露到
+  监控面板**：租约心跳等后台任务会先于业务调用发现问题，只靠"append 失败时上报"会
+  在应用空闲时漏掉。各状态的处置见上文「错误处理」。
 - 同一批数据反复装载失败（典型是数据类型不合法导致的装载失败文件）：表现为持久化
   滞后正常但端到端可见延迟持续增长——第三层信号会兜住它，联系 Relyt 管理员
   处置。
+
+**日志侧**：切文件的某一步失败时，可重试的失败打 `WARN`（会自行恢复，含存储抖动与
+进程内部异常）；**数据/表定义被拒绝这类无法重试的失败打 `ERROR`** 且文案明确"重试不会
+好"，同时该流停止。
+
+### 用一条关键字接告警（推荐）
+
+四种停流态发生时，SDK 各打一条固定格式的日志，**关键字 `RELYT_OBSERVE_ALARM`**，与
+Relyt 其它组件同一格式——配一条 grep 规则即可覆盖全部：
+
+```
+RELYT_OBSERVE_ALARM:[ALARM_LEVEL=Fatal,ALARM_LOG_TIME=2030-01-02 03:04:05,ALARM_LOG_MODULE=INGEST-SDK],ALARM_MSG=ingest stream stopped and will not resume on its own. table=public.orders writer_id=orders-p0 serial_group=... cause=... action=...
+```
+
+- `ALARM_LOG_MODULE=INGEST-SDK` 区分是本 SDK 发的；只 grep `RELYT` 也能命中。
+- `ALARM_MSG` 里带 **表名、writer_id、serial_group、原因、该做什么**，无需查 Relyt 侧
+  就能定位到是哪条流、为什么停、下一步动作。
+- 每个 writer 每次停流**只报一条**（多个后台任务可能同时发现同一状态）。
+- 级别固定 `Fatal`：这四种都不会自愈。
+
+**顺序错乱（`StagingOrderViolation`）这条尤其重要**，因为它是唯一需要人工回拨 Kafka
+位点的情形，告警正文里直接带出缺口区间，运维照着操作即可，例如：
+
+```
+cause=... seqs 8..=8 of epoch 1789460671000 never arrived; Kafka offsets 111..=129 are not
+in staging. A restart resumes after the highest staged offset and will NOT re-stage that gap.
+action=stop consuming this stream, do NOT commit its Kafka offsets, then rewind the consumer
+to the offset range named above and restart; ...
+```
+
+即：把该消费组的位点回拨到 **111**，再启动。回拨方法与注意事项见上文
+「什么时候需要人工回拨 Kafka 位点」。
+
+**前提：SDK 通过 `tracing` 输出，需要你的应用装了 subscriber**（如
+`tracing_subscriber::fmt().init()`）才会有任何日志，包括上面这条告警行。
+
+**为什么用关键字而不是日志级别配告警**：
+
+| | 回答的问题 | 出现频率 |
+|---|---|---|
+| `WARN` | SDK 正在自行处理，会恢复（上传重试、通知重连、清理跳过一轮等） | 可能很多条 |
+| `ERROR` | SDK 处理不了 | 少量 |
+| `RELYT_OBSERVE_ALARM` | **一条运行中的流停了，需要人介入** | 每个 writer 每次停流仅 1 条 |
+
+两点容易踩：
+
+- **告警行是 `ERROR` 级**，因此常见的 `RUST_LOG=warn` 也能收到。按关键字而不是按级别配
+  告警，是为了**精确**，不是为了躲过级别过滤。
+- **`ERROR` 出现不等于流停了**：上文 B 类的集成错误（流根本没建起来）也打 `ERROR`，切文件
+  的可重试失败在恢复前也可能先打出日志。所以**按 `ERROR` 级别配告警会误报**，而关键字恰好
+  框出 `ERROR` 里"流已停止"的那个子集。
+
+建议：**告警规则只匹配 `RELYT_OBSERVE_ALARM`（或直接 grep `RELYT`）；收到后再回头看同一
+writer 的 `ERROR` / `WARN` 上下文定位细节。**
+
+**关于格式的承诺**：`RELYT_OBSERVE_ALARM` 这个关键字本身稳定，可以直接作为告警规则的匹配
+串。方括号里的字段与 `ALARM_MSG` 正文会随版本调整（增字段、改措辞），所以**不要解析字段、
+也不要按正文内容做匹配**——需要细节时看同一 writer 的上下文日志。
 
 **不建议**用 staging 目录的文件数量做滞后信号：已消费的文件默认会保留
 7 天（`gc_retain_days`）才清理，文件存在不代表未消费，堆积量与滞后没有
