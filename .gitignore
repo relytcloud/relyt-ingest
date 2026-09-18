@@ -17,3 +17,8 @@ ci/bins/
 *.odp
 *.ods
 *.odt
+
+# The slide generator falls in the same bucket: it is a build script for a
+# customer-facing deck, carries measured numbers inline, and has no role in
+# building or using the crate.
+relyt-ingest-deck-gen.py
