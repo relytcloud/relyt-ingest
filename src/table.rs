@@ -129,6 +129,11 @@ struct WriterInner {
     /// `check_order`): every append/flush/close then fails with
     /// StagingOrderViolation. Never reset, like `fenced`.
     order_fatal: std::sync::Mutex<Option<String>>,
+    /// Priority of the most urgent stopped state already announced (see
+    /// `fatal_priority`; `u8::MAX` = nothing announced yet). A priority
+    /// rather than a flag, so a state more urgent than the last one still
+    /// gets its line.
+    alarm_raised: std::sync::atomic::AtomicU8,
     /// Latest consumption-lag sample (see [`LagSnapshot`]); None until the
     /// first background sample lands.
     lag: std::sync::Mutex<Option<LagSnapshot>>,
@@ -188,8 +193,26 @@ struct Failing {
     last: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FailKind {
+/// Declares `FailKind` and, for the tests, the full list of its variants.
+///
+/// One declaration site on purpose. The list is what
+/// `a_landed_file_clears_stage_failures_but_not_terminal_states` walks, and
+/// a hand-written second copy has already drifted once: `Rotation` was added
+/// to the enum and the test went on checking the other three, so the very
+/// invariant that commit was about went uncovered.
+macro_rules! fail_kinds {
+    ($($(#[$doc:meta])* $variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum FailKind {
+            $($(#[$doc])* $variant,)+
+        }
+
+        #[cfg(test)]
+        const ALL_FAIL_KINDS: &[FailKind] = &[$(FailKind::$variant,)+];
+    };
+}
+
+fail_kinds! {
     /// A stage keeps failing on the file: `StagingStalled` once the attempt
     /// threshold is reached (or at once when permanent).
     Stage,
@@ -204,6 +227,48 @@ enum FailKind {
     /// The put stage's order tripwire fired and the stages stopped:
     /// `StagingOrderViolation`, for the same reason as `Fenced`.
     OrderViolation,
+    /// A stage gave up on a file whose data or schema was rejected:
+    /// `RotationFailed`. Terminal like the three above, and for the same
+    /// structural reason -- it has to survive the head-priority rule in
+    /// `report_failure` and the clearing in `land()`, both of which apply
+    /// only to `Stage`. Carried as a `Stage` entry, an earlier seq's
+    /// transient failure overwrote it and a later landing erased it, after
+    /// which the writer was dead and `fatal_error()` said nothing.
+    Rotation,
+}
+
+impl FailKind {
+    /// Whether the entry records a stopped writer rather than a file still
+    /// being retried. Terminal entries are never overwritten by another
+    /// failure and never cleared by a landing; a `Stage` entry is both.
+    ///
+    /// Exhaustive on purpose. The distinction used to be spelled
+    /// `!= FailKind::Stage` at each of the four places that act on it, which
+    /// is how a new terminal kind could be added without those places being
+    /// reconsidered; now the compiler asks which side it is on, once.
+    fn is_terminal(self) -> bool {
+        match self {
+            FailKind::Stage => false,
+            FailKind::PipelineGone
+            | FailKind::Fenced
+            | FailKind::OrderViolation
+            | FailKind::Rotation => true,
+        }
+    }
+}
+
+/// How much of a human a stopped state needs, lowest first -- the order
+/// `fatal_state` reports them in, kept here so the alarm sorts by the same
+/// rule. An order violation outranks the rest because it is the only one
+/// that leaves a gap someone has to rewind Kafka offsets to fill.
+fn fatal_priority(e: &Error) -> u8 {
+    match e {
+        Error::StagingOrderViolation(_) => 0,
+        Error::WriterFenced(_) => 1,
+        Error::SerialContractViolation(_) => 2,
+        Error::RotationFailed { .. } => 3,
+        _ => u8::MAX,
+    }
 }
 
 /// Publish a terminal state on the progress channel unless one is already
@@ -211,16 +276,22 @@ enum FailKind {
 /// race (a fence landing after the order tripwire fired, a gone pipeline
 /// after either); the first one to land is the real cause and the one whose
 /// remedy matters, so it stays. Returns whether this call wrote it.
-fn publish_terminal(progress: &watch::Sender<Progress>, kind: FailKind, last: String) -> bool {
+fn publish_terminal(
+    progress: &watch::Sender<Progress>,
+    kind: FailKind,
+    stage: &'static str,
+    cause: Option<Arc<Error>>,
+    last: String,
+) -> bool {
     progress.send_if_modified(|p| match &p.failing {
-        Some(f) if f.kind != FailKind::Stage => false,
+        Some(f) if f.kind.is_terminal() => false,
         _ => {
             p.failing = Some(Failing {
                 seq: i64::MIN,
-                stage: "pipeline",
+                stage,
                 attempts: 0,
                 permanent: true,
-                cause: None,
+                cause,
                 kind,
                 last,
             });
@@ -249,6 +320,13 @@ fn terminal_error(f: &Failing) -> Error {
         FailKind::PipelineGone => Error::WriterClosed,
         FailKind::Fenced => Error::WriterFenced(f.last.clone()),
         FailKind::OrderViolation => Error::StagingOrderViolation(f.last.clone()),
+        FailKind::Rotation => Error::RotationFailed {
+            stage: f.stage,
+            source: match &f.cause {
+                Some(c) => Arc::clone(c),
+                None => Arc::new(Error::Config(f.last.clone())),
+            },
+        },
     }
 }
 
@@ -404,6 +482,7 @@ impl TableWriter {
             instance_uuid,
             fenced: std::sync::Mutex::new(None),
             order_fatal: std::sync::Mutex::new(None),
+            alarm_raised: std::sync::atomic::AtomicU8::new(u8::MAX),
             lag: std::sync::Mutex::new(None),
             pipeline: PipelineHandle {
                 tx: seal_tx,
@@ -448,6 +527,17 @@ impl TableWriter {
     /// several partitions through several writers, not one writer through
     /// several tasks.
     pub async fn append(
+        &self,
+        batch: RecordBatch,
+        start_offset: i64,
+        end_offset: i64,
+    ) -> Result<()> {
+        self.append_inner(batch, start_offset, end_offset)
+            .await
+            .map_err(|e| crate::error::log_input_error("append", e))
+    }
+
+    async fn append_inner(
         &self,
         batch: RecordBatch,
         start_offset: i64,
@@ -560,11 +650,21 @@ impl TableWriter {
         self.inner.state.lock().await.staged_offset
     }
 
-    /// `Some(reason)` once this writer hit a non-retryable serial-contract
-    /// violation: its notifications are being dropped and an operator has to
-    /// resolve the writer-identity clash before it can make progress again.
+    /// `Some(reason)` once this writer has stopped for good: every further
+    /// `append` / `flush` / `close` will fail with the same thing.
+    ///
+    /// Covers all four ways a writer stops — the lease was lost to another
+    /// process, the ordering tripwire fired, a rotation stage failed in a
+    /// way retrying cannot fix, or the writer identity clashes with another
+    /// one — so a monitor polling this catches a stopped stream even while
+    /// the application is idle and not calling `append`. Background tasks
+    /// (the lease heartbeat above all) reach these states on their own, so
+    /// this is the signal that does not wait for the next call.
+    ///
+    /// Alerting guidance is in GUIDE.md; [`Self::lag`] is the separate,
+    /// non-fatal "falling behind" signal.
     pub fn fatal_error(&self) -> Option<String> {
-        self.inner.notifier.fatal(&self.inner.serial_group)
+        self.inner.fatal_reason()
     }
 
     /// Latest consumption-lag sample (refreshed ~every 30s in the
@@ -629,19 +729,44 @@ impl WriterInner {
     }
 
     fn check_health(&self) -> Result<()> {
-        // The order violation goes first: it is the one that needs a human
-        // to rewind offsets, and a fence landing afterwards must not hide
-        // that from the caller.
-        if let Some(detail) = self.order_fatal.lock().unwrap().clone() {
-            return Err(Error::StagingOrderViolation(detail));
-        }
-        if let Some(reason) = self.fenced.lock().unwrap().clone() {
-            return Err(Error::WriterFenced(reason));
-        }
-        match self.notifier.fatal(&self.serial_group) {
-            Some(msg) => Err(Error::SerialContractViolation(msg)),
+        match self.fatal_state() {
+            Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// The one place that decides whether this writer has stopped, so the
+    /// error `append` returns and the string [`TableWriter::fatal_error`]
+    /// reports can never disagree about it.
+    ///
+    /// Order matters when more than one state is set: the order violation
+    /// comes first because it is the only one that needs a human to rewind
+    /// Kafka offsets, and a fence landing afterwards must not hide that.
+    /// `RotationFailed` is read from the pipeline's progress channel rather
+    /// than a flag of its own -- that is where the stages publish it.
+    fn fatal_state(&self) -> Option<Error> {
+        if let Some(detail) = self.order_fatal.lock().unwrap().clone() {
+            return Some(Error::StagingOrderViolation(detail));
+        }
+        if let Some(reason) = self.fenced.lock().unwrap().clone() {
+            return Some(Error::WriterFenced(reason));
+        }
+        if let Some(msg) = self.notifier.fatal(&self.serial_group) {
+            return Some(Error::SerialContractViolation(msg));
+        }
+        // A permanent stage failure: the file at the head cannot be staged
+        // however many times it is retried, so the stream is stopped even
+        // though the pipeline is still turning.
+        let p = self.pipeline.progress.borrow();
+        match self.stall_error(&p, i64::MAX) {
+            Some(e @ Error::RotationFailed { .. }) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// `fatal_state` rendered for [`TableWriter::fatal_error`].
+    fn fatal_reason(&self) -> Option<String> {
+        self.fatal_state().map(|e| e.to_string())
     }
 
     /// Cut the whole buffer into one file and give it the next seq. With
@@ -818,7 +943,7 @@ impl WriterInner {
             .send_if_modified(|p| match &p.failing {
                 // An earlier terminal state (fenced, tripwire) is the real
                 // cause of the stages being gone: keep it and report it.
-                Some(f) if f.kind != FailKind::Stage => {
+                Some(f) if f.kind.is_terminal() => {
                     err = terminal_error(f);
                     false
                 }
@@ -941,6 +1066,50 @@ impl WriterInner {
         }
     }
 
+    /// This writer lost its lease: record why, log it, and raise the alarm.
+    /// The four call sites in the heartbeat all end the task right after, so
+    /// this is the single place a fence becomes visible.
+    fn fence(&self, reason: String) {
+        tracing::error!("{reason}");
+        {
+            let mut slot = self.fenced.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(reason.clone());
+            }
+        }
+        self.raise_stream_stopped();
+    }
+
+    /// Raise the stream-stopped alarm for the state `fatal_state` reports
+    /// right now, rather than for whatever the calling task happened to
+    /// discover.
+    ///
+    /// The alarm text and `fatal_error()` have to agree, because an operator
+    /// acts on the alarm: a fence and an order violation carry opposite
+    /// instructions -- "do not rewind" against "you must rewind" -- so
+    /// announcing whichever arrived first could tell someone to leave a gap
+    /// in place. Both therefore sort by `fatal_priority`.
+    ///
+    /// Hence a priority rather than a flag: normally one line per writer,
+    /// but a state MORE urgent than the one already announced gets a second.
+    /// Only ever an upgrade, so a writer cannot page repeatedly.
+    fn raise_stream_stopped(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(cause) = self.fatal_state() else {
+            return;
+        };
+        let prio = fatal_priority(&cause);
+        if self.alarm_raised.fetch_min(prio, Ordering::SeqCst) <= prio {
+            return;
+        }
+        crate::alarm::stream_stopped(
+            &format!("{}.{}", self.names.1, self.names.2),
+            &self.ident.writer_id,
+            &self.serial_group,
+            &cause,
+        );
+    }
+
     /// The order tripwire fired: record why, so every append/flush/close
     /// fails with it from now on. Never reset -- the gap it names is not
     /// something a running writer can repair.
@@ -954,7 +1123,14 @@ impl WriterInner {
         }
         // Wake anyone already parked in flush/close: the stages stop here
         // and nothing else will ever move the progress channel.
-        publish_terminal(&self.pipeline.progress_tx, FailKind::OrderViolation, detail);
+        publish_terminal(
+            &self.pipeline.progress_tx,
+            FailKind::OrderViolation,
+            "pipeline",
+            None,
+            detail,
+        );
+        self.raise_stream_stopped();
     }
 
     /// The put returned, so the file is durable: record the offset, then
@@ -1280,6 +1456,14 @@ fn spawn_ticker(inner: &Arc<WriterInner>) {
             if let Some(reason) = inner.notifier.fatal(&inner.serial_group) {
                 tracing::warn!(group = %inner.serial_group, %reason,
                     "ticker stopped: serial-contract violation; buffered rows are not staged");
+                // The fourth stopped state, and the only one a writer learns
+                // by reading someone else's flag rather than by setting it:
+                // the notify loop parks it on the group, and this tick is
+                // where the writer notices. Raised here rather than there so
+                // the alarm carries the table and writer_id, which the notify
+                // loop does not know; the once-only guard makes a second
+                // discoverer harmless.
+                inner.raise_stream_stopped();
                 break;
             }
             if let Err(e) = inner.seal_if_aged_nonblocking().await {
@@ -1325,11 +1509,15 @@ fn spawn_pipeline(
     tokio::spawn(put_stage(Arc::downgrade(inner), rx_put, progress));
 }
 
-/// Stage 1: dedup + CSV on the blocking pool. A render failure is
-/// deterministic (a row the formatter rejects), so it is reported as
-/// permanent -- `flush` sees it at once -- but the file is still retried at
-/// the capped backoff rather than skipped: skipping would drop rows and
-/// leave a seq hole `flush` could never wait out.
+/// Stage 1: dedup + CSV on the blocking pool.
+///
+/// Whether a failure is permanent is decided by `is_permanent` on the error
+/// itself, not by the stage: a rejection of the data or the schema cannot be
+/// retried into a CSV, while a panic or a cancellation in the blocking task
+/// may well succeed next time. A permanent one ends the stage -- it is
+/// neither retried nor skipped, because skipping would drop rows and leave a
+/// seq hole `flush` could never wait out. Everything else keeps retrying at
+/// the capped backoff.
 async fn render_stage(
     weak: Weak<WriterInner>,
     mut rx: mpsc::Receiver<Sealed>,
@@ -1357,7 +1545,27 @@ async fn render_stage(
                 }
                 Err(e) => {
                     attempt += 1;
-                    report_failure(&progress, &meta, "render", attempt, true, &e);
+                    let permanent = is_permanent(&e);
+                    report_failure(&progress, &meta, "render", attempt, permanent, &e);
+                    if permanent {
+                        // Retrying cannot turn these bytes into a CSV, so the
+                        // stage stops here rather than spinning: the writer is
+                        // already fatal (`fatal_state` reads this very entry)
+                        // and every caller now gets the cause.
+                        // A protected terminal entry rather than a Stage one:
+                        // an earlier seq's transient failure would overwrite a
+                        // Stage entry and a later landing would clear it,
+                        // leaving the writer dead with nothing to report.
+                        publish_terminal(
+                            &progress,
+                            FailKind::Rotation,
+                            "render",
+                            Some(Arc::new(clone_error(&e))),
+                            format!("render: {e}"),
+                        );
+                        inner.raise_stream_stopped();
+                        return;
+                    }
                     drop(inner);
                     tokio::time::sleep(backoff(attempt)).await;
                 }
@@ -1493,7 +1701,24 @@ async fn gzip_stage(
                     }
                     Err(e) => {
                         attempt += 1;
-                        report_failure(&progress, &meta, "gzip", attempt, true, &e);
+                        let permanent = is_permanent(&e);
+                        report_failure(&progress, &meta, "gzip", attempt, permanent, &e);
+                        if permanent {
+                            let Some(inner) = weak.upgrade() else { return };
+                            // A protected terminal entry rather than a Stage one:
+                            // an earlier seq's transient failure would overwrite a
+                            // Stage entry and a later landing would clear it,
+                            // leaving the writer dead with nothing to report.
+                            publish_terminal(
+                                &progress,
+                                FailKind::Rotation,
+                                "gzip",
+                                Some(Arc::new(clone_error(&e))),
+                                format!("gzip: {e}"),
+                            );
+                            inner.raise_stream_stopped();
+                            return;
+                        }
                         tokio::time::sleep(backoff(attempt)).await;
                     }
                 }
@@ -1591,8 +1816,27 @@ async fn put_stage(
                     break ms(started.elapsed());
                 }
                 Err(e) => {
+                    // Storage errors are transient by nature, so this is
+                    // almost always false; it goes through the same predicate
+                    // so no stage has a rule of its own.
                     attempt += 1;
-                    report_failure(&progress, &meta, "put", attempt, false, &e);
+                    let permanent = is_permanent(&e);
+                    report_failure(&progress, &meta, "put", attempt, permanent, &e);
+                    if permanent {
+                        // A protected terminal entry rather than a Stage one:
+                        // an earlier seq's transient failure would overwrite a
+                        // Stage entry and a later landing would clear it,
+                        // leaving the writer dead with nothing to report.
+                        publish_terminal(
+                            &progress,
+                            FailKind::Rotation,
+                            "put",
+                            Some(Arc::new(clone_error(&e))),
+                            format!("put: {e}"),
+                        );
+                        inner.raise_stream_stopped();
+                        return;
+                    }
                     drop(inner);
                     tokio::time::sleep(backoff(attempt)).await;
                 }
@@ -1648,6 +1892,26 @@ fn clone_error(err: &Error) -> Error {
     }
 }
 
+/// Whether retrying this file can ever succeed.
+///
+/// Judged on what the error IS, not on which stage produced it. Only a
+/// rejection of the data or the schema is beyond retry: the file's bytes
+/// cannot be turned into a CSV however many times we try, and the rows have
+/// to reach a human. Everything else — a storage error, a panic in a
+/// blocking task, a task cancelled while the runtime winds down — may well
+/// succeed next time, and stopping the stream for it would turn a blip into
+/// an outage.
+///
+/// A panic that really is a deterministic bug therefore retries forever
+/// rather than stopping the stream. That is the deliberate trade: it stays
+/// visible (a WARN per attempt, a growing `lag_seconds`, and `flush`
+/// reporting `StagingStalled`) and it recovers by itself if the cause was
+/// transient, whereas a wrong "permanent" verdict needs an operator to
+/// restart a stream that would have healed.
+fn is_permanent(err: &Error) -> bool {
+    matches!(err, Error::Schema(_) | Error::UnsupportedType { .. })
+}
+
 /// Retry pacing for a failing stage: 1s, 2s, 4s, 8s, 16s, then 30s.
 fn backoff(attempt: u32) -> Duration {
     let secs = 1u64 << attempt.saturating_sub(1).min(5);
@@ -1668,7 +1932,7 @@ fn land(progress: &watch::Sender<Progress>, seq: i64) {
         p.durable_seq = Some(seq);
         if p.failing
             .as_ref()
-            .is_some_and(|f| f.kind == FailKind::Stage && f.seq <= seq)
+            .is_some_and(|f| !f.kind.is_terminal() && f.seq <= seq)
         {
             p.failing = None;
         }
@@ -1684,19 +1948,32 @@ fn report_failure(
     permanent: bool,
     err: &Error,
 ) {
-    tracing::warn!(
-        stage,
-        serial_seq = meta.serial_seq,
-        attempt,
-        permanent,
-        error = %err,
-        "rotation stage failed; the same file will be retried"
-    );
+    // Two different operational situations, so two different levels: a
+    // transient failure clears itself and is worth a WARN; a permanent one
+    // needs someone to act and must not be filtered out with the noise.
+    if permanent {
+        tracing::error!(
+            stage,
+            serial_seq = meta.serial_seq,
+            attempt,
+            error = %err,
+            "rotation stage failed permanently; retrying will not fix it and this stream \
+             has stopped -- see the error for what to repair"
+        );
+    } else {
+        tracing::warn!(
+            stage,
+            serial_seq = meta.serial_seq,
+            attempt,
+            error = %err,
+            "rotation stage failed; the same file will be retried"
+        );
+    }
     let last = format!("{stage}: {err}");
     progress.send_if_modified(|p| {
         match &p.failing {
             // A terminal state (fenced, pipeline gone) is never overwritten.
-            Some(f) if f.kind != FailKind::Stage => return false,
+            Some(f) if f.kind.is_terminal() => return false,
             // The slot reports the HEAD of the pipeline: a later file
             // failing behind a stuck earlier one must not hide the earlier
             // one from a flush waiting on it. Same seq updates in place.
@@ -1754,7 +2031,14 @@ fn fenced_exit(inner: &WriterInner, stage: &str, meta: &FileMeta) -> bool {
         .unwrap()
         .clone()
         .unwrap_or_else(|| "writer was fenced".into());
-    publish_terminal(&inner.pipeline.progress_tx, FailKind::Fenced, reason);
+    publish_terminal(
+        &inner.pipeline.progress_tx,
+        FailKind::Fenced,
+        "pipeline",
+        None,
+        reason,
+    );
+    inner.raise_stream_stopped();
     true
 }
 
@@ -1978,20 +2262,154 @@ mod tests {
             .expect("flush returns")
             .unwrap_err();
         assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
-        // Fill the one-slot queue behind the stuck stage through the
-        // append path (pure backpressure, still returns while room exists).
-        w.append(b.clone(), 1, 1).await.unwrap();
-        assert!(w.inner.seal_and_send(false, false).await.unwrap().is_some());
-        assert_eq!(w.inner.pipeline.tx.capacity(), 0);
-        // Now nothing can be handed over. flush must still come back, and
-        // must not have cut the buffer it could not deliver.
-        w.append(b, 2, 2).await.unwrap();
+        // The writer has stopped for good -- a permanent stage failure is
+        // one of the fatal states -- so every further call reports the same
+        // thing rather than accepting more rows.
+        assert!(w.fatal_error().is_some());
+        let e = w.append(b, 1, 1).await.unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
         let e = tokio::time::timeout(Duration::from_secs(10), w.flush())
+            .await
+            .expect("flush must not hang")
+            .unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+    }
+
+    /// A permanent failure now stops the stage instead of spinning on a
+    /// file it can never render: the channel closes behind it, which is how
+    /// a caller can tell the pipeline is done rather than still working.
+    #[tokio::test]
+    async fn a_permanent_failure_stops_the_pipeline() {
+        let w = writer_with("missing", 1, ClientConfig::DEFAULT_ROTATE_SIZE);
+        let b = one_row(w.schema());
+        w.append(b, 0, 0).await.unwrap();
+        w.inner.seal_and_send(false, false).await.unwrap();
+        // One backoff is 1s; give the render stage room to fail, report and
+        // exit, then confirm it did not queue up for another attempt.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(w.fatal_error().is_some(), "the writer is fatal");
+        assert!(
+            w.inner.pipeline.tx.is_closed(),
+            "the render stage exited, closing the seal channel behind it"
+        );
+        // The failure it reported is the permanent kind, so a waiter is told
+        // retrying will not help rather than to keep flushing.
+        let e = w.flush().await.unwrap_err();
+        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+    }
+
+    /// A pipeline stalled on a TRANSIENT failure still takes rows while the
+    /// queue has room, and once it is full `flush` reports rather than
+    /// hanging -- the backpressure path, which a permanent failure
+    /// short-circuits by stopping the stream instead.
+    #[tokio::test]
+    async fn a_transient_stall_still_accepts_rows_until_the_queue_is_full() {
+        // The default size threshold, so `append` only buffers and the test
+        // decides when a file is cut. Depth 1, so the queue fills as soon as
+        // the stages behind it are each holding one.
+        let w = writer_with("id", 1, ClientConfig::DEFAULT_ROTATE_SIZE);
+        let b = one_row(w.schema());
+        // The store is unreachable, so the put stage retries transiently and
+        // everything backs up behind it. Seal while there is still room.
+        for i in 0..24i64 {
+            if w.inner.pipeline.tx.capacity() == 0 {
+                break;
+            }
+            w.append(b.clone(), i, i).await.unwrap();
+            w.inner.seal_and_send(false, false).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(w.inner.pipeline.tx.capacity(), 0, "the queue is full");
+        // A retryable stall must not page anyone, and must not be fatal.
+        assert!(w.fatal_error().is_none(), "a retryable stall is not fatal");
+        // One more row stays buffered. flush has to come back rather than
+        // hang on the full queue, and must not cut a buffer it cannot hand
+        // over.
+        w.append(b, 100, 100).await.unwrap();
+        let e = tokio::time::timeout(Duration::from_secs(30), w.flush())
             .await
             .expect("flush must not hang on a full queue")
             .unwrap_err();
-        assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
+        assert!(matches!(e, Error::StagingStalled { .. }), "{e}");
         assert_eq!(w.inner.state.lock().await.buffered.len(), 1);
+    }
+
+    /// Review finding on MR 4: a permanent failure was recorded as an
+    /// ordinary Stage entry, so an earlier seq's transient failure
+    /// overwrote it and a later landing cleared it -- after which the
+    /// writer was dead and `fatal_error()` reported nothing.
+    #[tokio::test]
+    async fn a_permanent_failure_survives_later_stage_traffic() {
+        let w = test_writer();
+        let tx = &w.inner.pipeline.progress_tx;
+        let err = Error::Config("x".into());
+
+        // The permanent record, as the stages now publish it.
+        publish_terminal(
+            tx,
+            FailKind::Rotation,
+            "render",
+            Some(Arc::new(Error::Schema(
+                "column `id` is not in the batch".into(),
+            ))),
+            "render: schema".into(),
+        );
+        assert!(w.fatal_error().is_some());
+
+        // An EARLIER seq failing transiently must not take the slot.
+        report_failure(tx, &meta(1), "put", 1, false, &err);
+        assert_eq!(
+            tx.borrow().failing.as_ref().map(|f| f.kind),
+            Some(FailKind::Rotation)
+        );
+        // Nor may a landing clear it.
+        land(tx, i64::MAX);
+        assert_eq!(
+            tx.borrow().failing.as_ref().map(|f| f.kind),
+            Some(FailKind::Rotation)
+        );
+        // Still fatal, and still naming the real cause.
+        let reason = w.fatal_error().expect("still fatal");
+        assert!(reason.contains("not in the batch"), "{reason}");
+    }
+
+    /// Review finding on MR 4: the alarm kept whichever state arrived first
+    /// while `fatal_error()` sorts them, so a fence landing before an order
+    /// violation had the alarm saying "do not rewind" and the writer saying
+    /// "you must".
+    #[tokio::test]
+    async fn the_alarm_upgrades_to_the_more_urgent_state() {
+        let w = test_writer();
+        // A fence first: the least urgent of the two.
+        *w.inner.fenced.lock().unwrap() = Some("preempted".into());
+        w.inner.raise_stream_stopped();
+        assert_eq!(
+            w.inner
+                .alarm_raised
+                .load(std::sync::atomic::Ordering::SeqCst),
+            fatal_priority(&Error::WriterFenced(String::new()))
+        );
+        // The order violation outranks it, so it gets its own line.
+        w.inner.trip_order_fatal("seqs 8..=8 never arrived".into());
+        assert_eq!(
+            w.inner
+                .alarm_raised
+                .load(std::sync::atomic::Ordering::SeqCst),
+            fatal_priority(&Error::StagingOrderViolation(String::new()))
+        );
+        // And what a caller is told matches what was announced.
+        assert!(matches!(
+            w.inner.check_health(),
+            Err(Error::StagingOrderViolation(_))
+        ));
+        // A third call adds nothing: only upgrades page.
+        w.inner.raise_stream_stopped();
+        assert_eq!(
+            w.inner
+                .alarm_raised
+                .load(std::sync::atomic::Ordering::SeqCst),
+            fatal_priority(&Error::StagingOrderViolation(String::new()))
+        );
     }
 
     /// Review finding on the first cut: the stages checked only that the
@@ -2166,27 +2584,28 @@ mod tests {
     async fn append_reports_a_stalled_pipeline_without_taking_the_batch() {
         let w = writer_with("missing", 1, 1);
         let b = one_row(w.schema());
-        // Every append seals its own file. Yield after each so the render
-        // stage (current-thread runtime: it runs only when this task yields)
-        // has taken file 1 and reported its permanent failure before file 2
-        // arrives; file 2 then fills the one-slot queue.
+        // Every append seals its own file. Yield so the render stage
+        // (current-thread runtime: it runs only when this task yields) takes
+        // file 1 and reports its failure before the next append.
         w.append(b.clone(), 0, 0).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        w.append(b.clone(), 1, 1).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let e = tokio::time::timeout(Duration::from_secs(10), w.append(b.clone(), 2, 2))
+
+        // The failure is permanent, so the writer has stopped: the next
+        // append reports it instead of parking on the queue, and does not
+        // take the batch.
+        let e = tokio::time::timeout(Duration::from_secs(10), w.append(b.clone(), 1, 1))
             .await
             .expect("append must not park on a stalled pipeline")
             .unwrap_err();
         assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
-        // Not accepted: the batch is not in the buffer, and the offset
-        // high-water mark rolled back so the same batch can be retried.
         {
             let st = w.inner.state.lock().await;
-            assert!(st.buffered.is_empty());
-            assert_eq!(st.max_end_offset, Some(1));
+            assert!(st.buffered.is_empty(), "the batch was not taken");
+            assert_eq!(st.max_end_offset, Some(0), "the water mark did not move");
         }
-        let e = w.append(b, 2, 2).await.unwrap_err();
+        // And it keeps reporting it rather than accepting rows.
+        assert!(w.fatal_error().is_some());
+        let e = w.append(b, 1, 1).await.unwrap_err();
         assert!(matches!(e, Error::RotationFailed { .. }), "{e}");
     }
 
@@ -2291,6 +2710,107 @@ mod tests {
         }
     }
 
+    /// The permanence verdict is on the error, not on the stage that hit
+    /// it: only a rejection of the data or the schema is beyond retry, so a
+    /// panic in a blocking task (which is what a JoinError is) keeps being
+    /// retried instead of stopping a stream that may well recover.
+    #[test]
+    fn only_data_and_schema_errors_are_beyond_retry() {
+        // Cannot be turned into a CSV however often we try.
+        assert!(is_permanent(&Error::Schema(
+            "pk column not in batch".into()
+        )));
+        assert!(is_permanent(&Error::UnsupportedType {
+            column: "c".into(),
+            data_type: "Interval".into(),
+        }));
+
+        // A blocking task that panicked or was cancelled: this is the only
+        // failure the render and gzip stages can actually reach through the
+        // public API, and it must not stop the stream.
+        assert!(!is_permanent(&Error::Config(
+            "render task failed: task panicked".into()
+        )));
+        assert!(!is_permanent(&Error::Config(
+            "gzip task failed: task was cancelled".into()
+        )));
+
+        // Storage and control-plane trouble: transient by nature.
+        assert!(!is_permanent(&Error::Config("connection reset".into())));
+        assert!(!is_permanent(&Error::WriterClosed));
+    }
+
+    /// `fatal_error()` used to report only one of the four ways a writer
+    /// stops, while the guide told operators to build their dashboard on it
+    /// -- so a fenced writer, a tripped tripwire or a permanent stage
+    /// failure all showed green.
+    #[tokio::test]
+    async fn fatal_error_covers_every_stopped_state() {
+        // Healthy: nothing to report.
+        let w = test_writer();
+        assert!(w.fatal_error().is_none());
+        assert!(w.inner.check_health().is_ok());
+
+        // 1. Preempted lease.
+        let w = test_writer();
+        *w.inner.fenced.lock().unwrap() = Some("taken over by another process".into());
+        let reason = w.fatal_error().expect("fenced writer is fatal");
+        assert!(reason.contains("taken over"), "{reason}");
+        assert!(matches!(
+            w.inner.check_health(),
+            Err(Error::WriterFenced(_))
+        ));
+
+        // 2. Order tripwire.
+        let w = test_writer();
+        w.inner.trip_order_fatal("seqs 8..=8 never arrived".into());
+        let reason = w.fatal_error().expect("order violation is fatal");
+        assert!(reason.contains("8..=8"), "{reason}");
+        assert!(matches!(
+            w.inner.check_health(),
+            Err(Error::StagingOrderViolation(_))
+        ));
+
+        // 3. Writer identity clash, recorded by the notify loop on the group
+        // rather than set by this writer -- the state the ticker discovers.
+        let w = test_writer();
+        w.inner
+            .notifier
+            .arm_fatal_for_test(&w.inner.serial_group, "duplicate writer_id");
+        let reason = w.fatal_error().expect("identity clash is fatal");
+        assert!(reason.contains("duplicate writer_id"), "{reason}");
+        assert!(matches!(
+            w.inner.check_health(),
+            Err(Error::SerialContractViolation(_))
+        ));
+
+        // 4. A stage failure retrying cannot fix.
+        let w = test_writer();
+        report_failure(
+            &w.inner.pipeline.progress_tx,
+            &meta(4),
+            "render",
+            1,
+            true,
+            &Error::Schema("column `id` is not in the batch".into()),
+        );
+        let reason = w.fatal_error().expect("permanent stage failure is fatal");
+        assert!(reason.contains("not in the batch"), "{reason}");
+
+        // A transient one is NOT fatal: it clears itself, and a monitor must
+        // not page on it.
+        let w = test_writer();
+        report_failure(
+            &w.inner.pipeline.progress_tx,
+            &meta(4),
+            "put",
+            w.inner.cfg.staging_error_after_attempts,
+            false,
+            &Error::Config("connection reset".into()),
+        );
+        assert!(w.fatal_error().is_none(), "a retryable stall is not fatal");
+    }
+
     /// Review finding on the fifth round: known_files carried the session
     /// epoch, so lag_seconds read "time since open", not file age.
     #[tokio::test]
@@ -2369,11 +2889,15 @@ mod tests {
     /// entry at or below its seq, and terminal states carry i64::MIN, so a
     /// fence that landed during `record_durable` was wiped and the flush it
     /// should have woken parked forever.
+    ///
+    /// Walks `ALL_FAIL_KINDS` rather than a list written out here: the
+    /// earlier hand-written one silently stopped covering `Rotation` the
+    /// moment that variant was added.
     #[tokio::test]
     async fn a_landed_file_clears_stage_failures_but_not_terminal_states() {
         let w = test_writer();
         let tx = &w.inner.pipeline.progress_tx;
-        let kind = || {
+        let current = || {
             w.inner
                 .pipeline
                 .progress
@@ -2385,13 +2909,11 @@ mod tests {
 
         report_failure(tx, &meta(5), "put", 1, false, &Error::Config("x".into()));
         land(tx, 5);
-        assert_eq!(kind(), None, "the stage failure is caught up with");
+        assert_eq!(current(), None, "the stage failure is caught up with");
 
-        for terminal in [
-            FailKind::Fenced,
-            FailKind::PipelineGone,
-            FailKind::OrderViolation,
-        ] {
+        for &kind in ALL_FAIL_KINDS {
+            // seq i64::MIN as every terminal writer records it, which is what
+            // made the landing comparison match them in the first place.
             tx.send_modify(|p| {
                 p.failing = Some(Failing {
                     seq: i64::MIN,
@@ -2399,16 +2921,16 @@ mod tests {
                     attempts: 0,
                     permanent: true,
                     cause: None,
-                    kind: terminal,
+                    kind,
                     last: "terminal".into(),
                 })
             });
             land(tx, 9);
-            assert_eq!(
-                kind(),
-                Some(terminal),
-                "{terminal:?} must survive a landing"
-            );
+            if kind.is_terminal() {
+                assert_eq!(current(), Some(kind), "{kind:?} must survive a landing");
+            } else {
+                assert_eq!(current(), None, "{kind:?} is cleared by a landing");
+            }
         }
     }
 
@@ -2550,8 +3072,7 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
                                     ident.lock_key(),
                                     lease.as_secs()
                                 );
-                                tracing::error!("{reason}");
-                                *inner.fenced.lock().unwrap() = Some(reason);
+                                inner.fence(reason);
                                 return;
                             }
                         }
@@ -2564,8 +3085,7 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
                         ident.lock_key(),
                         l.describe()
                     );
-                    tracing::error!("{reason}");
-                    *inner.fenced.lock().unwrap() = Some(reason);
+                    inner.fence(reason);
                     return;
                 }
                 Ok(None) => {
@@ -2573,8 +3093,7 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
                         "lease at `{}` was deleted (operator force-release) — stopping",
                         ident.lock_key()
                     );
-                    tracing::error!("{reason}");
-                    *inner.fenced.lock().unwrap() = Some(reason);
+                    inner.fence(reason);
                     return;
                 }
                 Err(e) => {
@@ -2587,8 +3106,7 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
                             ident.lock_key(),
                             lease.as_secs()
                         );
-                        tracing::error!("{reason}");
-                        *inner.fenced.lock().unwrap() = Some(reason);
+                        inner.fence(reason);
                         return;
                     }
                 }

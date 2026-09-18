@@ -279,6 +279,19 @@ impl Notifier {
     pub fn clear_fatal(&self, key: &str) -> bool {
         self.state.lock().unwrap().fatal.remove(key).is_some()
     }
+
+    /// Arm the contract violation that `notify_loop` records when the server
+    /// answers with one. Tests only: it is the one stopped state a writer
+    /// cannot reach without a live server rejecting a submission, which is
+    /// why `fatal_error`'s coverage test could not reach it from `table.rs`.
+    #[cfg(test)]
+    pub(crate) fn arm_fatal_for_test(&self, key: &str, msg: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .fatal
+            .insert(key.to_string(), msg.to_string());
+    }
 }
 
 async fn notify_loop(
