@@ -4,8 +4,9 @@ Rust ingest SDK for Relyt tables: Kafka → OSS/S3 CSV staging → async load jo
 the Relyt master executes as parallel upsert loads.
 The data plane never crosses the Relyt master. API shape follows delta-rs.
 
-- **User guide: [GUIDE.md](GUIDE.md)** — deployment topologies, latency-relevant
-  knobs and their defaults, runnable examples under `examples/`
+- **User guide: [GUIDE.md](GUIDE.md)** ([简体中文](GUIDE.zh-CN.md)) — integration
+  checklist, deployment topologies, capacity planning, latency-relevant knobs and
+  their defaults, error handling, runnable examples under `examples/`
 - Server-side prerequisites: Relyt **3.55.0 or later**, provisioned for ingest
   (`relyt_get_serial_group_watermark`, `relyt_get_instance_id`,
   `relyt_get_ingest_staging_config`; terminal-job retention enabled)
@@ -26,6 +27,10 @@ Staging stores: Alibaba OSS and AWS S3 are covered end to end. Tencent COS,
 Kingsoft KS3, UCloud US3 and Volcengine TOS are recognised by endpoint and
 signed as S3-compatible, but the integration suite does not run against them
 yet.
+
+The full version floor — including the one `deltalake` 0.32.x imposes on top of
+this crate's MSRV — is in
+[GUIDE.md: prerequisites](GUIDE.md#prerequisites).
 
 ## Usage sketch
 
@@ -110,20 +115,19 @@ move forward within a writer (`append` refuses a rewound batch with a
 
 ## Deployment sizing (multi-writer)
 
-Per-writer isolation is deliberate (a stuck table stalls only its own queue),
-so two resources scale linearly with W = tables x partitions per process:
+Per-writer isolation is deliberate (a stuck table stalls only its own queue), so
+resident connections, memory and CPU all scale linearly with W = tables x
+partitions per process. As a rule of thumb the defaults cost **1 + 2W resident
+connections**, a **576MB per writer** memory bound and **up to 2 cores per
+writer**, so 10 tables x 32 partitions = 320 writers lands near 641 connections
+and a 180GB bound — lower `rotate_size_bytes` to bring that down.
 
-| Resource | Formula | Why |
-|---|---|---|
-| master connections (resident) | **1 (control) + 2W**: one notify connection and one lag-sampler connection per writer. Short-lived on top: one GC connection per writer per hour, and under managed staging one credential refresh per **process** every 5 minutes | each serial_group lazily owns a notify loop with its own connection; the lag sampler keeps one rather than forking a backend every 30s |
-| memory upper bound | **W x (6 + `rotation_queue_depth`) x `rotate_size_bytes`** ((6 + 3) x 64MB = 576MB per writer by default) | one buffer filling + `rotation_queue_depth` (default 3) sealed files queued + up to ~5 file-equivalents in flight across the render / gzip / put stages and the slots between them; a full queue blocks `append`, so this is a hard bound and actual residency is usually far below it |
-| background tasks | 7W tokio tasks (ticker / GC / lease heartbeat / lag sampler / render / gzip / put) + W notify loops | negligible |
-| tokio blocking threads | up to **2 per writer** (render, gzip; held only while working) against tokio's default cap of 512 | past ~256 busy writers raise the runtime's `max_blocking_threads`; exceeding it queues rather than fails, and shows up as throughput loss. Their stacks are outside the memory formula above |
+The formulas behind those numbers, what each resource is spent on, and how to
+size a container are in
+**[GUIDE.md: capacity planning](GUIDE.md#capacity-planning-multi-writer)**
+([简体中文](GUIDE.zh-CN.md#容量估算多-writer)), kept in one place so the numbers
+cannot drift apart.
 
-Example: 10 tables x 32 partitions = 320 writers -> ~641 resident connections
-(budget against the master's `max_connections`) and a 320 x 576MB ~ 180GB
-memory bound; at `rotate_size_bytes` = 16MB it is ~45GB (or rely on the 15s
-time threshold to keep files small).
 Connection multiplexing for hundreds of writers is a tracked follow-up.
 
 ## Tests

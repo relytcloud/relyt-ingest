@@ -356,7 +356,8 @@ pub struct ClientConfig {
     /// Rotate the current staging file when it reaches this many bytes.
     /// The 64MB default is sized for one or a few writers; with W writers in
     /// one process the buffered memory bound is W x this value, so size it
-    /// accordingly (see GUIDE.md "容量估算" / README "Deployment sizing").
+    /// accordingly (see GUIDE.md "Capacity planning (multi-writer)" / README
+    /// "Deployment sizing").
     pub rotate_size_bytes: u64,
     /// ... or when the oldest buffered row is this old, whichever first.
     pub rotate_interval_max: Duration,
@@ -415,7 +416,8 @@ pub struct ClientConfig {
     /// pipeline busy while the buffer refills; the rest absorb a producer
     /// burst before `append` blocks. Default 3; each slot costs
     /// `rotate_size_bytes` of memory. The per-writer memory bound is
-    /// (6 + this) x `rotate_size_bytes` (GUIDE.md "容量估算").
+    /// (6 + this) x `rotate_size_bytes` (GUIDE.md "Capacity planning
+    /// (multi-writer)").
     pub rotation_queue_depth: usize,
 
     /// After this many consecutive failed attempts to stage the file at the

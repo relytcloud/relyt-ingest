@@ -2102,7 +2102,7 @@ fn check_order(
          {epoch} seq {seq} (offsets up to {end}): {}{gap}. A restart resumes after the \
          highest staged offset and will NOT re-stage that gap. Stop consuming this stream, \
          do not commit its Kafka offsets, roll back or upgrade the SDK, then rewind the \
-         consumer to the start of the gap (GUIDE.md, 错误处理).",
+         consumer to the start of the gap (GUIDE.md, \"Error handling\").",
         next.epoch_ms, next.seq, next.start_offset, next.end_offset, why
     ))
 }
@@ -3115,9 +3115,10 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
     });
 }
 
-/// Consumption-lag sampler (GUIDE.md "消费延迟监控"): every `lag_sample_interval`
-/// (~30s), read the server group watermark over one long-lived control
-/// connection and publish a [`LagSnapshot`] through [`TableWriter::lag`].
+/// Consumption-lag sampler (GUIDE.md "Monitoring lag, and what to alert on"):
+/// every `lag_sample_interval` (~30s), read the server group watermark over one
+/// long-lived control connection and publish a [`LagSnapshot`] through
+/// [`TableWriter::lag`].
 ///
 /// The numbers come from the writer's own record of what it staged
 /// (`WriterState::known_files`, seeded from the recovery listing at open and
