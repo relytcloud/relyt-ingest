@@ -1,0 +1,63 @@
+# Release: publish the tagged version to crates.io, then cut a GitHub release.
+#
+# Trigger: pushing a tag `vX.Y.Z`. Who may publish is therefore exactly who may
+# create such a tag on this repository -- enforce that with a tag ruleset.
+#
+# Authentication is crates.io Trusted Publishing: the job presents a GitHub
+# OIDC token and receives a short-lived crates.io token in exchange. No
+# long-lived secret is stored anywhere. This needs a one-time setup on
+# crates.io by a crate owner (crate -> Settings -> Trusted Publishing -> GitHub:
+# owner relytcloud, repository relyt-ingest, workflow release.yml, environment
+# release). The very first version of a crate cannot use it and is published
+# by hand.
+#
+# The `release` environment exists so that required reviewers can be attached
+# later without touching this file; crates.io can also pin the publisher to it.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # crates.io Trusted Publishing (OIDC)
+      contents: write   # gh release create
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - name: the tag must name the version in Cargo.toml
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$crate_version" != "$tag_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate_version}"
+            exit 1
+          fi
+
+      - name: obtain a short-lived crates.io token (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: cargo publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: GitHub release with generated notes
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
