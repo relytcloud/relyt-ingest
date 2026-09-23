@@ -140,6 +140,14 @@ pub enum Error {
     /// The table handle was closed / the background writer task is gone.
     #[error("writer closed")]
     WriterClosed,
+
+    /// A fault-injection point fired. Only reachable in a build with the
+    /// `failpoints` feature, which the published crate is not; it exists so
+    /// a test can tell an injected failure apart from a real one instead of
+    /// matching on a message.
+    #[cfg(feature = "failpoints")]
+    #[error("injected failure at `{point}`{}", .arg.as_deref().map(|a| format!(" ({a})")).unwrap_or_default())]
+    Injected { point: String, arg: Option<String> },
 }
 
 /// Whether this error is a rejection of the caller's own input: the

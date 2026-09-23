@@ -7,6 +7,20 @@ minor release may contain breaking changes; each one is called out here.
 
 ## [Unreleased]
 
+- The `failpoints` cargo feature exists for Relyt's own fault-injection tests
+  and is off by default: leave it off. With it on, the crate pulls in `fail`
+  and compiles named injection points into the staging and lease paths, where
+  a configured point makes a call fail or aborts the process deliberately.
+  The default build carries neither the dependency nor the checks.
+- Fixed: `close()` could leave the writer lease behind. It released the lease
+  by read-then-delete while the lease heartbeat renewed it by read-then-write,
+  with nothing keeping the two apart; a renewal that straddled the release
+  wrote the lease back, under a log line saying it had been released. A
+  process that exited right after `close()` never cleaned that up, and a
+  writer on another host then waited out the whole `lock_lease_timeout`.
+  `close()` now stops the heartbeat and waits for it before touching the
+  lease (at most one storage round trip), retries the release, and logs
+  "lease released" only when it was.
 - Initial release: one writer per Kafka partition stages Arrow record batches
   as CSV objects on OSS/S3 and hands them to the Relyt master as serially
   ordered upsert loads. Staging location and credentials are supplied by the

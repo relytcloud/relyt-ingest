@@ -110,6 +110,11 @@
 //!   that writer's watermark, GC, and queue; the operational SOP (skip +
 //!   resume) lives in GUIDE.md and is exercised by the e2e suite.
 
+// Declared first: it defines the `failpoint!` / `crash_point!` macros, and
+// a macro_rules! macro is only visible to modules declared after it.
+#[macro_use]
+mod failpoints;
+
 mod alarm;
 mod client;
 mod config;
@@ -137,5 +142,11 @@ pub use config::{
     ClientConfig, CsvConfig, Staging, StagingCompression, StagingConfig, StagingService, StreamMode,
 };
 pub use error::{Error, Result};
+/// Fault-injection control surface, present only in a `failpoints` build.
+///
+/// The catalogue of points and the rules for using them live in the crate's
+/// internal `failpoints` module; the integration suite is the consumer.
+#[cfg(feature = "failpoints")]
+pub use failpoints::testing as failpoints_testing;
 pub use recovery::RecoveryPlan;
 pub use table::{LagSnapshot, TableWriter};

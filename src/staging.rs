@@ -56,7 +56,9 @@ impl StagingStore {
     /// Whole-object write. Same key + same bytes on retry — no .tmp+rename,
     /// no multipart bookkeeping needed at these sizes (<=64MB).
     pub async fn put(&self, key: &str, bytes: impl Into<opendal::Buffer>) -> Result<()> {
+        failpoint!("staging::put::before");
         self.op.write(key, bytes).await?;
+        crash_point!("staging::put::after");
         Ok(())
     }
 
@@ -67,6 +69,7 @@ impl StagingStore {
         &self,
         ident: &WriterIdentity,
     ) -> Result<(Vec<StagedFile>, Vec<String>)> {
+        failpoint!("staging::list_staged");
         let dir = ident.staging_dir();
         let mut staged = Vec::new();
         let mut unknown = Vec::new();
@@ -90,6 +93,7 @@ impl StagingStore {
     /// quietly disable the resume shortcut AND the epoch anti-rollback
     /// anchor. The operator escape hatch is [`Self::delete_state`].
     pub async fn read_state(&self, ident: &WriterIdentity) -> Result<Option<StateFile>> {
+        failpoint!("staging::read_state");
         let key = ident.state_key();
         match self.op.read(&key).await {
             Ok(buf) => {
@@ -109,7 +113,9 @@ impl StagingStore {
 
     /// Overwrite the writer's persistent state.
     pub async fn write_state(&self, ident: &WriterIdentity, state: &StateFile) -> Result<()> {
+        failpoint!("staging::write_state::before");
         self.op.write(&ident.state_key(), state.to_bytes()).await?;
+        crash_point!("staging::write_state::after");
         Ok(())
     }
 
@@ -117,6 +123,7 @@ impl StagingStore {
     /// immutable). The RAM/IAM policy for the SDK account should scope
     /// delete to `<prefix>/staging/*`.
     pub async fn delete_staged(&self, ident: &WriterIdentity, f: &StagedFile) -> Result<()> {
+        failpoint!("staging::delete_staged");
         self.op.delete(&f.object_key(ident)).await?;
         Ok(())
     }
@@ -125,6 +132,7 @@ impl StagingStore {
     /// same fail-loud rationale as `read_state` (a garbled lock must not be
     /// silently treated as absent — delete it explicitly to force-release).
     pub async fn read_lock(&self, ident: &WriterIdentity) -> Result<Option<LockFile>> {
+        failpoint!("staging::read_lock");
         let key = ident.lock_key();
         match self.op.read(&key).await {
             Ok(buf) => {
@@ -143,6 +151,7 @@ impl StagingStore {
 
     /// Overwrite the writer lease (acquire, heartbeat renew, or takeover).
     pub async fn write_lock(&self, ident: &WriterIdentity, lock: &LockFile) -> Result<()> {
+        failpoint!("staging::write_lock");
         let bytes = serde_json::to_vec_pretty(lock).expect("LockFile serializes");
         self.op.write(&ident.lock_key(), bytes).await?;
         Ok(())
@@ -150,6 +159,7 @@ impl StagingStore {
 
     /// Delete the writer lease (release, or operator force-release).
     pub async fn delete_lock(&self, ident: &WriterIdentity) -> Result<()> {
+        failpoint!("staging::delete_lock");
         self.op.delete(&ident.lock_key()).await?;
         Ok(())
     }
@@ -158,6 +168,7 @@ impl StagingStore {
     /// treats the writer as fresh (full re-notify; the identifier unique key
     /// and the submission gate absorb the replays).
     pub async fn delete_state(&self, ident: &WriterIdentity) -> Result<()> {
+        failpoint!("staging::delete_state");
         self.op.delete(&ident.state_key()).await?;
         Ok(())
     }

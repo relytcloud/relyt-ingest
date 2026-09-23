@@ -342,6 +342,12 @@ async fn notify_loop(
                     if req.serial_seq >= slot.0 {
                         *slot = (req.serial_seq, req.end_offset);
                     }
+                    // The server owns the file but this process has not
+                    // recorded it anywhere durable yet. A crash here must
+                    // not make recovery load it a second time -- the
+                    // submission gate is what prevents that, and the crash
+                    // case is what proves the gate is reached.
+                    crash_point!("notify::after");
                     break;
                 }
                 Ok(SubmitOutcome::ContractViolation(msg)) => {

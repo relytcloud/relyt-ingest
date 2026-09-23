@@ -677,7 +677,14 @@ async fn acquire_writer_lease(
     // lock_heartbeat_interval.
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     match staging.read_lock(ident).await? {
-        Some(l) if l.instance_uuid == instance_uuid => Ok(()),
+        Some(l) if l.instance_uuid == instance_uuid => {
+            // The lease is ours and recorded. Dying here leaves a lock
+            // object with a fresh heartbeat and no process behind it --
+            // the case that separates "same host, restart at once" from
+            // "another host, wait the lease out".
+            crash_point!("lease::held");
+            Ok(())
+        }
         Some(l) => Err(Error::WriterLocked(format!(
             "lost the acquire race: {} at `{}`",
             l.describe(),
