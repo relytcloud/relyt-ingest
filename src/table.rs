@@ -137,6 +137,21 @@ struct WriterInner {
     /// Latest consumption-lag sample (see [`LagSnapshot`]); None until the
     /// first background sample lands.
     lag: std::sync::Mutex<Option<LagSnapshot>>,
+    /// How `close()` stops the lease heartbeat before it releases the lease.
+    ///
+    /// The heartbeat renews by read-then-write and `close()` releases by
+    /// read-then-delete. Left to race, a renewal that read before the
+    /// delete writes after it, and the lease is back -- this process's pid,
+    /// a fresh timestamp -- under a log line that says "lease released". In
+    /// a running process the next heartbeat tick sees the writer is gone
+    /// and cleans up; a process that exits right after `close()`, as a
+    /// graceful shutdown does, never gets that tick, and a writer on another
+    /// host then waits out the whole lease. So `close()` signals the
+    /// heartbeat through the `Notify`, JOINS it through the handle, and only
+    /// then touches the lease: the join, not the signal, is what guarantees
+    /// no write is in flight when the delete runs.
+    heartbeat_stop: Arc<tokio::sync::Notify>,
+    heartbeat: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Producer side of this writer's rotation pipeline (module docs).
     pipeline: PipelineHandle,
 }
@@ -484,6 +499,8 @@ impl TableWriter {
             order_fatal: std::sync::Mutex::new(None),
             alarm_raised: std::sync::atomic::AtomicU8::new(u8::MAX),
             lag: std::sync::Mutex::new(None),
+            heartbeat_stop: Arc::new(tokio::sync::Notify::new()),
+            heartbeat: std::sync::Mutex::new(None),
             pipeline: PipelineHandle {
                 tx: seal_tx,
                 seal_lock: Mutex::new(()),
@@ -699,16 +716,23 @@ impl TableWriter {
         self.inner.flush_pipeline().await?;
         self.inner.persist_state_if_due().await;
         let staged = self.inner.state.lock().await.staged_offset;
-        if let Ok(Some(l)) = self.inner.store().read_lock(&self.inner.ident).await {
-            if l.instance_uuid == self.inner.instance_uuid {
-                let _ = self.inner.store().delete_lock(&self.inner.ident).await;
-            }
+        // Stop the heartbeat FIRST and wait for it: a renewal that read the
+        // lock before the delete below would otherwise write it straight
+        // back (see `WriterInner::heartbeat_stop`).
+        self.inner.stop_heartbeat().await;
+        if self.inner.release_lease().await {
+            tracing::info!(
+                group = %self.inner.serial_group,
+                staged_offset = ?staged,
+                "writer closed: buffer drained, lease released"
+            );
+        } else {
+            tracing::info!(
+                group = %self.inner.serial_group,
+                staged_offset = ?staged,
+                "writer closed: buffer drained; the lease could NOT be released (see the warning above)"
+            );
         }
-        tracing::info!(
-            group = %self.inner.serial_group,
-            staged_offset = ?staged,
-            "writer closed: buffer drained, lease released"
-        );
         Ok(staged)
     }
 }
@@ -722,6 +746,70 @@ impl WriterInner {
     /// The url base of the staging snapshot current right now.
     fn url_base(&self) -> String {
         self.staging.current().url_base.clone()
+    }
+
+    /// Stop the lease heartbeat and wait until it has stopped.
+    ///
+    /// The wait is the point. Notifying alone leaves a renewal that has
+    /// already read the lock free to write it back after the delete that
+    /// follows, and aborting the task cannot recall a PUT that has left the
+    /// process; only a join guarantees the write path is empty. Bounded,
+    /// because a renewal that storage has left hanging must not turn
+    /// `close()` into a hang as well -- on timeout `close()` proceeds as it
+    /// did before this existed, and says so.
+    async fn stop_heartbeat(&self) {
+        self.heartbeat_stop.notify_one();
+        let handle = self.heartbeat.lock().unwrap().take();
+        let Some(handle) = handle else { return };
+        if tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                group = %self.serial_group,
+                "lease heartbeat did not stop within 30s; releasing the lease anyway -- \
+                 a renewal still in flight may recreate it"
+            );
+        }
+    }
+
+    /// Release the lease if it is still ours; true when nothing of ours is
+    /// left behind.
+    ///
+    /// Best effort with a short retry, and never an error out of `close()`:
+    /// the data is durable by the time this runs, and a caller who sees
+    /// `close()` fail would rightly wonder whether it landed. But a release
+    /// that storage refused used to be swallowed by a `let _` and followed
+    /// by a log line saying "lease released" -- while the lease sat there
+    /// for a writer on another host to wait out. Now it is retried, and if
+    /// it still fails the warning names that consequence.
+    async fn release_lease(&self) -> bool {
+        let mut last = None;
+        for attempt in 1..=3u32 {
+            match self.store().read_lock(&self.ident).await {
+                Ok(Some(l)) if l.instance_uuid == self.instance_uuid => {
+                    match self.store().delete_lock(&self.ident).await {
+                        Ok(()) => return true,
+                        Err(e) => last = Some(e),
+                    }
+                }
+                // Already gone, or someone else's to keep: nothing of ours
+                // remains either way.
+                Ok(_) => return true,
+                Err(e) => last = Some(e),
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
+            }
+        }
+        tracing::warn!(
+            group = %self.serial_group,
+            key = %self.ident.lock_key(),
+            error = %last.expect("three attempts, all failed"),
+            "could not release the writer lease after 3 attempts; a writer on another host \
+             will have to wait it out (a same-host restart takes over at once)"
+        );
+        false
     }
 
     fn is_fenced(&self) -> bool {
@@ -905,6 +993,11 @@ impl WriterInner {
         };
         let seq = sealed.meta.serial_seq;
         permit.send(sealed);
+        // The rows have left the buffer and nothing is staged yet: dying
+        // here is the window in which a crash loses them outright. It is
+        // safe only because their offsets were never committed, so a replay
+        // brings them back -- which is what the crash case checks.
+        crash_point!("seal::after");
         Ok(Some(seq))
     }
 
@@ -1256,6 +1349,13 @@ impl WriterInner {
                 let mut st = self.state.lock().await;
                 st.resume_persisted = resume;
                 st.state_written_at = Instant::now();
+                // The resume shortcut is now on durable storage while this
+                // process still holds everything else in memory. Dying here
+                // is what would let a later session trust a state file that
+                // ran ahead of the data -- distinct from the low-level
+                // `staging::write_state::after`, which also covers the very
+                // first write at open, before anything is staged.
+                crash_point!("state::after");
             }
             Err(e) => {
                 // Non-fatal: state is a shortcut + beacon; recovery still has
@@ -3023,7 +3123,8 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
     let me = inner.instance_uuid.clone();
     let period = inner.cfg.lock_heartbeat_interval;
     let lease = inner.cfg.lock_lease_timeout;
-    tokio::spawn(async move {
+    let stop = Arc::clone(&inner.heartbeat_stop);
+    let handle = tokio::spawn(async move {
         let tick = Duration::from_secs(2).min(period);
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3031,7 +3132,22 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
         let mut since_beat = period; // renew on the first real tick
         let mut last_verified = Instant::now();
         loop {
-            interval.tick().await;
+            tokio::select! {
+                // `biased`, stop first. After a long iteration the interval
+                // holds a missed tick that is ready at the same instant as
+                // the stop permit, and an unbiased select picks between them
+                // at random. Every time the tick won, this task ran one more
+                // full renewal before looking again, and `close()` -- joining
+                // it -- waited another round trip. Checking stop first makes
+                // that wait exactly one in-flight renewal, never more.
+                biased;
+                // `close()` is about to release the lease and waits for this
+                // task to be gone before it does. Leave the lock alone from
+                // here: the release is close()'s, and a renewal written now
+                // would be exactly the race it is waiting out.
+                _ = stop.notified() => return,
+                _ = interval.tick() => {}
+            }
             let inner: Arc<WriterInner> = match Weak::upgrade(&weak) {
                 Some(i) => i,
                 None => {
@@ -3051,6 +3167,14 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
             match staging.current().store.read_lock(&ident).await {
                 Ok(Some(l)) if l.instance_uuid == me => {
                     let mut renewed = l;
+                    // The lock has been read as ours and is about to be
+                    // written back. Anything that releases the lease in this
+                    // gap is undone by the write -- see `close()`.
+                    delay_point!("lease::renew::between");
+                    // Stamped when written, not when read: the stamp is what
+                    // a competing writer judges staleness by, and what a test
+                    // uses to tell a write made before close() from one made
+                    // after it.
                     renewed.heartbeat_at_ms = crate::lock::now_ms();
                     match staging.current().store.write_lock(&ident, &renewed).await {
                         Ok(()) => {
@@ -3113,6 +3237,7 @@ fn spawn_lock_heartbeat(inner: &Arc<WriterInner>) {
             }
         }
     });
+    *inner.heartbeat.lock().unwrap() = Some(handle);
 }
 
 /// Consumption-lag sampler (GUIDE.md "Monitoring lag, and what to alert on"):

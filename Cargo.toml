@@ -59,6 +59,15 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 
+# Fault injection, behind the default-off `failpoints` feature.
+# `fail`'s own macros also compile to nothing unless ITS `failpoints` feature
+# is on, so both have to be enabled together -- with the feature off this
+# crate builds exactly as before, no extra dependency and no runtime check.
+fail = { version = "0.5", optional = true }
+
+[features]
+failpoints = ["dep:fail", "fail/failpoints"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 

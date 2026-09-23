@@ -139,6 +139,8 @@ writer.append(batch, start_offset, end_offset).await?;
 //    （staged_offset 是"最后一条已持久化"，含；建议周期性提交。）
 // 4. 进程退出（含滚动升级的 SIGTERM）时调用 close()：排空尾巴并立即释放
 //    writer 租约，接替进程零等待启动：
+// close() 会先停掉租约心跳并等在途的一次续期完成（最多一次存储往返），再删除租约，
+// 租约不会在它身后被写回。
 writer.close().await?;
 ```
 
@@ -236,7 +238,7 @@ CPU 上界 2 核。给容器定规格时注意两点：
 |---|---|---|
 | `boolean` | `Boolean` | 渲染为 `t`/`f` |
 | `smallint` / `integer` / `bigint` | `Int16` / `Int32` / `Int64` | |
-| `real` / `double precision` | `Float32` / `Float64` | 普通值精确；`NaN`/`±Infinity` 目前不保证与服务端约定一致，避免写入 |
+| `real` / `double precision` | `Float32` / `Float64` | 普通值精确；`NaN`/`±Infinity` 同样可以往返——写出为 `NaN`/`inf`/`-inf`，读回是 PostgreSQL 自己的拼法 `NaN`/`Infinity`/`-Infinity`。每次 CI 都会验证 |
 | `numeric(p,s)` / `decimal(p,s)`，p ≤ 38 | `Decimal128(p, s)` | **精度与标度必须与表定义完全一致**；不带精度的裸 `numeric` 不支持 |
 | `text` / `varchar` / `varchar(n)` / `char(n)` | `Utf8` | 任意 Unicode（含中文、emoji、换行、引号、分隔符本身）原样写入；仅 `\0` 被剥离 |
 | `date` | `Date32` | |

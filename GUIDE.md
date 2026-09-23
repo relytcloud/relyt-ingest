@@ -165,6 +165,8 @@ writer.append(batch, start_offset, end_offset).await?;
 // 4. On exit — including SIGTERM during a rolling upgrade — call close(): it
 //    drains the tail and releases the writer lease at once, so the successor
 //    process starts with no wait:
+// close() stops the lease heartbeat and waits for any renewal in flight (at most one
+// storage round trip) before it deletes the lease, so the lease cannot come back behind it.
 writer.close().await?;
 ```
 
@@ -281,7 +283,7 @@ it from `writer.schema()` aligns them automatically:
 |---|---|---|
 | `boolean` | `Boolean` | rendered as `t`/`f` |
 | `smallint` / `integer` / `bigint` | `Int16` / `Int32` / `Int64` | |
-| `real` / `double precision` | `Float32` / `Float64` | ordinary values are exact; `NaN` and `±Infinity` are not yet guaranteed to match the server's convention, so avoid writing them |
+| `real` / `double precision` | `Float32` / `Float64` | ordinary values are exact; `NaN` and `±Infinity` round-trip as well — written as `NaN` / `inf` / `-inf` and read back in PostgreSQL's own spelling, `NaN` / `Infinity` / `-Infinity`. Exercised on every CI run |
 | `numeric(p,s)` / `decimal(p,s)`, p ≤ 38 | `Decimal128(p, s)` | **precision and scale must match the table definition exactly**; bare `numeric` without precision is unsupported |
 | `text` / `varchar` / `varchar(n)` / `char(n)` | `Utf8` | any Unicode (CJK, emoji, newlines, quotes, the delimiter itself) is written verbatim; only `\0` is stripped |
 | `date` | `Date32` | |

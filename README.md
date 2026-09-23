@@ -142,6 +142,4 @@ is not part of the published crate.
 
 ## Open items
 
-- float rendering: `NaN`/`±inf` render as Rust's `NaN`/`inf`; the Relyt master
-  expects `NaN`/`Infinity`.
 - Schema cache fallback; see the review follow-up issues for the rest.
