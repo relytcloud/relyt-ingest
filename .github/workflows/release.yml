@@ -48,11 +48,31 @@ jobs:
             exit 1
           fi
 
+      # A version already on crates.io is not an error: the first release of a
+      # crate is published by hand (Trusted Publishing cannot bootstrap it),
+      # and re-running a tag must not fail on a duplicate upload. Publishing
+      # is skipped in that case; the GitHub release below still runs.
+      - name: is this version already published?
+        id: published
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: relyt-ingest release workflow' \
+            "https://crates.io/api/v1/crates/relyt-ingest/${version}")
+          if [ "$code" = "200" ]; then
+            echo "::notice::relyt-ingest ${version} is already on crates.io; skipping publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: obtain a short-lived crates.io token (Trusted Publishing)
         id: auth
+        if: steps.published.outputs.skip == 'false'
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: cargo publish
+        if: steps.published.outputs.skip == 'false'
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
